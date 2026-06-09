@@ -229,9 +229,14 @@ export class PubgBatchService {
         );
 
         const statsList = res.data?.data || [];
-        const batchAccountIds = new Set<string>();
-        for (const entry of statsList) {
-          const accountId = entry.id || '';
+        const processedInBatch = new Set<string>();
+
+        for (let i = 0; i < statsList.length; i++) {
+          const entry = statsList[i];
+          // 批量端点返回的 entry.id 可能为 undefined（部分账号格式），降级按数组索引匹配
+          const accountId = entry.id || (i < uncachedIds.length ? uncachedIds[i] : '');
+          if (!accountId) continue;
+
           const attributes = entry.attributes || {};
           const gameModeStats = attributes.gameModeStats?.[gameMode] || {};
 
@@ -249,25 +254,23 @@ export class PubgBatchService {
             winPoints: gameModeStats.winPoints || 0,
           };
 
-          if (accountId) {
-            batchAccountIds.add(accountId);
-            const result: SeasonStatsResult = { accountId, stats };
-            results.push(result);
-            // 写 Redis 缓存
-            await this.cacheService.set(
-              CacheNamespace.SEASON_STATS,
-              stats,
-              undefined,
-              seasonId,
-              accountId,
-            );
-          }
+          processedInBatch.add(accountId);
+          const result: SeasonStatsResult = { accountId, stats };
+          results.push(result);
+          // 写 Redis 缓存
+          await this.cacheService.set(
+            CacheNamespace.SEASON_STATS,
+            stats,
+            undefined,
+            seasonId,
+            accountId,
+          );
         }
 
-        // 批量 API 可能对部分账号返回空（如赛季无比赛记录），对这些账号走单点兜底
-        const missingIds = uncachedIds.filter((id) => !batchAccountIds.has(id));
+        // 批量 API 未覆盖的账号走单点兜底
+        const missingIds = uncachedIds.filter((id) => !processedInBatch.has(id));
         if (missingIds.length > 0) {
-          this.logger.warn(`[SeasonBatch] 批量 API 未返回 ${missingIds.length} 个账号的数据，启动单点兜底`);
+          this.logger.warn(`[SeasonBatch] 批量 API 未覆盖 ${missingIds.length} 个账号，启动单点兜底`);
           for (const id of missingIds) {
             const retryResult = await this.fetchSingleSeasonStats(id, seasonId, gameMode);
             if (retryResult) {
