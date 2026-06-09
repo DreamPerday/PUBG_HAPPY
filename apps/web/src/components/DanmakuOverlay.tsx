@@ -83,7 +83,7 @@ export default function DanmakuOverlay({ pageId, active = true }: DanmakuOverlay
   useEffect(() => {
     if (!active) return
 
-    const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001'
+    const baseUrl = (import.meta.env.VITE_API_URL || 'http://localhost:3001').replace(/\/+$/, '')
     const socket: Socket = io(`${baseUrl}/ws/social`, {
       transports: ['websocket', 'polling'],
     })
