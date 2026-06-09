@@ -38,6 +38,7 @@ export default function Admin() {
   const [aiForm, setAiForm] = useState({ ai_api_key: '', ai_base_url: '', ai_model: '', ai_weekly_prompt: '', ai_match_prompt: '' })
   const [showKey, setShowKey] = useState(false)
   const [savingAi, setSavingAi] = useState(false)
+  const [syncingAll, setSyncingAll] = useState(false)
 
   const handleLogin = () => {
     if (password === 'pubg123') {
@@ -95,6 +96,22 @@ export default function Admin() {
     } catch (err: any) {
       const msg = err.response?.data?.message || '同步失败'
       alert(msg)
+    }
+  }
+
+  const handleSyncAll = async () => {
+    if (!window.confirm('确定要同步所有用户数据吗？这可能需要较长时间，请耐心等待。')) return
+    setSyncingAll(true)
+    try {
+      const res = await api.post('/admin/sync-all')
+      const data = res.data?.data || res.data
+      const msg = `同步完成！\n总计: ${data.total} 人\n成功: ${data.synced} 人\n失败: ${data.failed} 人\n赛季数据: ${data.seasonStats} 人`
+      alert(msg)
+      fetchData()
+    } catch (err: any) {
+      alert('批量同步失败: ' + (err.response?.data?.message || err.message))
+    } finally {
+      setSyncingAll(false)
     }
   }
 
@@ -370,9 +387,19 @@ export default function Admin() {
             <Users className="w-5 h-5 text-pubg-orange" />
             注册用户
           </h2>
-          <button onClick={fetchData} className="text-xs sm:text-sm text-pubg-muted hover:text-pubg-orange transition-colors touch-btn">
-            刷新
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleSyncAll}
+              disabled={syncingAll}
+              className="flex items-center gap-1.5 text-xs sm:text-sm px-3 py-1.5 rounded-lg bg-pubg-orange/10 text-pubg-orange hover:bg-pubg-orange/20 transition-colors disabled:opacity-50 touch-btn"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${syncingAll ? 'animate-spin' : ''}`} />
+              {syncingAll ? '同步中...' : '一键同步所有'}
+            </button>
+            <button onClick={fetchData} className="text-xs sm:text-sm text-pubg-muted hover:text-pubg-orange transition-colors touch-btn">
+              刷新
+            </button>
+          </div>
         </div>
         <div className="overflow-x-auto mt-4">
           <table className="w-full min-w-[640px]">
