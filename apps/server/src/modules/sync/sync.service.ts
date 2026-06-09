@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../../prisma.service';
 import { PubgBatchService } from '../pubg/services/pubg-batch.service';
+import { PubgRateLimiterService } from '../pubg/services/pubg-rate-limiter.service';
 import { chunkArray } from '../../common/utils/chunk';
 import axios from 'axios';
 
@@ -22,28 +23,11 @@ export class SyncService {
     process.env.PUBG_API_BASE || 'https://api.pubg.com/shards/steam';
   private readonly apiKey = process.env.PUBG_API_KEY;
 
-  /** 限流器：≤8 req/min（匹配详情请求专用的独立限流器） */
-  private matchTimestamps: number[] = [];
-  private readonly matchMaxPerMinute = 8;
-  private readonly matchWindowMs = 60_000;
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly pubgBatchService: PubgBatchService,
+    private readonly rateLimiter: PubgRateLimiterService,
   ) {}
-
-  /** 匹配详情专用限流 */
-  private async waitForMatchRateLimit(): Promise<void> {
-    const now = Date.now();
-    this.matchTimestamps = this.matchTimestamps.filter((t) => now - t < this.matchWindowMs);
-    if (this.matchTimestamps.length >= this.matchMaxPerMinute) {
-      const oldest = this.matchTimestamps[0];
-      const waitMs = this.matchWindowMs - (now - oldest) + 1000;
-      this.logger.warn(`[PUBG 限流] 匹配详情等待 ${Math.round(waitMs / 1000)} 秒`);
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-    this.matchTimestamps.push(Date.now());
-  }
 
   // ==================== 批量同步（改造核心） ====================
 
@@ -244,11 +228,13 @@ export class SyncService {
     // 仍然没有 accountId，需要请求 /players API
     if (!accountId) {
       this.logger.log(`玩家 ${pubgId} 无 accountId，需要请求 /players API`);
-      await this.waitForMatchRateLimit();
-      const playerRes = await axios.get(`${this.pubgBase}/players`, {
-        headers,
-        params: { 'filter[playerNames]': pubgId },
-      });
+      const playerRes = await this.rateLimiter.executeWithRetry(
+        () => axios.get(`${this.pubgBase}/players`, {
+          headers,
+          params: { 'filter[playerNames]': pubgId },
+        }),
+        `PlayerLookup(${pubgId})`,
+      );
 
       const playerData = playerRes.data?.data?.[0];
       if (!playerData) {
@@ -267,11 +253,13 @@ export class SyncService {
 
     // 从玩家信息的 relationships.matches 中获取比赛列表
     // 需要再请求一次 /players 获取 match list（PUBG API 限制）
-    await this.waitForMatchRateLimit();
-    const playerRes = await axios.get(`${this.pubgBase}/players`, {
-      headers,
-      params: { 'filter[playerNames]': pubgId },
-    });
+    const playerRes = await this.rateLimiter.executeWithRetry(
+      () => axios.get(`${this.pubgBase}/players`, {
+        headers,
+        params: { 'filter[playerNames]': pubgId },
+      }),
+      `PlayerMatches(${pubgId})`,
+    );
 
     const playerData = playerRes.data?.data?.[0];
     if (!playerData) {
@@ -313,25 +301,16 @@ export class SyncService {
 
     for (const matchId of batch) {
       try {
-        await this.waitForMatchRateLimit();
-        const detailRes = await axios.get(
-          `${this.pubgBase}/matches/${matchId}`,
-          { headers: matchHeaders },
+        const detailRes = await this.rateLimiter.executeWithRetry(
+          () => axios.get(
+            `${this.pubgBase}/matches/${matchId}`,
+            { headers: matchHeaders },
+          ),
+          `MatchDetail(${matchId.slice(0, 8)}...)`,
         );
-        matchDetails.push(detailRes.data);
+        matchDetails.push(detailRes);
       } catch (err: any) {
         this.logger.warn(`获取比赛 ${matchId} 详情失败: ${err.message}`);
-        if (err.response?.status === 429) {
-          this.logger.warn('触发官方限流，等待后重试...');
-          await new Promise((r) => setTimeout(r, 10000));
-          try {
-            const retryRes = await axios.get(
-              `${this.pubgBase}/matches/${matchId}`,
-              { headers: matchHeaders },
-            );
-            matchDetails.push(retryRes.data);
-          } catch { /* 放弃 */ }
-        }
       }
     }
 

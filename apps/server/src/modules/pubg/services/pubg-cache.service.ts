@@ -29,12 +29,21 @@ export class PubgCacheService {
       lazyConnect: true,
       maxRetriesPerRequest: 3,
       retryStrategy: (times) => {
-        if (times > 3) return null;
-        return Math.min(times * 200, 2000);
+        // 永不停止重连，避免连接断开后永久不可用
+        // 指数退避: 1s, 2s, 4s, 8s, ... 最大 30s
+        const delay = Math.min(1000 * Math.pow(2, times - 1), 30000);
+        this.logger.warn(`Redis 断线重连中 (第 ${times} 次尝试, 等待 ${delay}ms)`);
+        return delay;
       },
     });
     this.redis.on('error', (err) => {
       this.logger.warn(`Redis 连接错误: ${err.message}`);
+    });
+    this.redis.on('reconnecting', () => {
+      this.logger.log('Redis 正在重连...');
+    });
+    this.redis.on('connect', () => {
+      this.logger.log('Redis 重连成功');
     });
   }
 

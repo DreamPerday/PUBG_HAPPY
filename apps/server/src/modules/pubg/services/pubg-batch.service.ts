@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../../prisma.service';
 import { PubgCacheService, CacheNamespace } from './pubg-cache.service';
+import { PubgRateLimiterService } from './pubg-rate-limiter.service';
 import { chunkArray } from '../../../common/utils/chunk';
 import axios from 'axios';
 
@@ -22,31 +23,14 @@ export class PubgBatchService {
   private readonly pubgBase: string;
   private readonly apiKey: string;
 
-  /** 限流：≤8 req/min */
-  private timestamps: number[] = [];
-  private readonly maxPerMinute = 8;
-  private readonly windowMs = 60_000;
-
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     private readonly cacheService: PubgCacheService,
+    private readonly rateLimiter: PubgRateLimiterService,
   ) {
     this.pubgBase = this.configService.get<string>('pubg.baseUrl') || 'https://api.pubg.com/shards/steam';
     this.apiKey = this.configService.get<string>('pubg.apiKey') || '';
-  }
-
-  /** 限流等待 */
-  private async waitForRateLimit(): Promise<void> {
-    const now = Date.now();
-    this.timestamps = this.timestamps.filter((t) => now - t < this.windowMs);
-    if (this.timestamps.length >= this.maxPerMinute) {
-      const oldest = this.timestamps[0];
-      const waitMs = this.windowMs - (now - oldest) + 1000;
-      this.logger.warn(`[PUBG 限流] 等待 ${Math.round(waitMs / 1000)} 秒`);
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-    this.timestamps.push(Date.now());
   }
 
   private getHeaders() {
@@ -99,15 +83,17 @@ export class PubgBatchService {
       }
 
       // 3. 未命中缓存的需要请求 API
-      await this.waitForRateLimit();
       const namesParam = uncachedIds.join(',');
       this.logger.log(`[BatchPlayer] 请求 API 获取 ${uncachedIds.length} 玩家`);
 
       try {
-        const res = await axios.get(`${this.pubgBase}/players`, {
-          headers: this.getHeaders(),
-          params: { 'filter[playerNames]': namesParam },
-        });
+        const res = await this.rateLimiter.executeWithRetry(
+          () => axios.get(`${this.pubgBase}/players`, {
+            headers: this.getHeaders(),
+            params: { 'filter[playerNames]': namesParam },
+          }),
+          `BatchPlayer(${namesParam})`,
+        );
 
         const playerList = res.data?.data || [];
         for (const player of playerList) {
@@ -226,14 +212,16 @@ export class PubgBatchService {
         continue;
       }
 
-      // 2. 请求 Batch API
-      await this.waitForRateLimit();
+      // 2. 请求 Batch API（带自动重试）
       const filterParam = uncachedIds.join(',');
 
       try {
-        const res = await axios.get(
-          `${this.pubgBase}/seasons/${seasonId}/gameMode/${gameMode}/players`,
-          { headers: this.getHeaders(), params: { 'filter[playerIds]': filterParam } },
+        const res = await this.rateLimiter.executeWithRetry(
+          () => axios.get(
+            `${this.pubgBase}/seasons/${seasonId}/gameMode/${gameMode}/players`,
+            { headers: this.getHeaders(), params: { 'filter[playerIds]': filterParam } },
+          ),
+          `SeasonBatch(${gameMode},${uncachedIds.length}人)`,
         );
 
         const statsList = res.data?.data || [];
@@ -270,8 +258,8 @@ export class PubgBatchService {
           }
         }
       } catch (err: any) {
-        this.logger.error(`[SeasonBatch] API 请求失败: ${err.message}`);
-        // 对于失败的玩家，尝试单点重试（兜底策略）
+        this.logger.error(`[SeasonBatch] 批量 API 请求失败: ${err.message}`);
+        // 对于失败的玩家，尝试单点兜底（带重试）
         for (const id of uncachedIds) {
           const retryResult = await this.fetchSingleSeasonStats(id, seasonId, gameMode);
           if (retryResult) {
@@ -285,17 +273,19 @@ export class PubgBatchService {
     return results;
   }
 
-  /** 兜底：单个玩家赛季数据（用于批处理失败时的降级） */
+  /** 兜底：单个玩家赛季数据（用于批处理失败时的降级，带自动重试确保障终能获取） */
   private async fetchSingleSeasonStats(
     accountId: string,
     seasonId: string,
     gameMode: string,
   ): Promise<SeasonStatsResult | null> {
     try {
-      await this.waitForRateLimit();
-      const res = await axios.get(
-        `${this.pubgBase}/players/${accountId}/seasons/${seasonId}`,
-        { headers: this.getHeaders() },
+      const res = await this.rateLimiter.executeWithRetry(
+        () => axios.get(
+          `${this.pubgBase}/players/${accountId}/seasons/${seasonId}`,
+          { headers: this.getHeaders() },
+        ),
+        `SingleSeason(${accountId.slice(0, 8)}...,${gameMode})`,
       );
       const attributes = res.data?.data?.attributes || {};
       const modeStats = attributes.gameModeStats?.[gameMode] || {};

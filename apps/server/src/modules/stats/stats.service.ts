@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 import { PubgBatchService } from '../pubg/services/pubg-batch.service';
 import { PubgCacheService, CacheNamespace } from '../pubg/services/pubg-cache.service';
+import { PubgRateLimiterService } from '../pubg/services/pubg-rate-limiter.service';
 import axios from 'axios';
 
 @Injectable()
@@ -10,27 +11,12 @@ export class StatsService {
   private readonly pubgBase = process.env.PUBG_API_BASE || 'https://api.pubg.com/shards/steam';
   private readonly apiKey = process.env.PUBG_API_KEY;
 
-  /** 限流器 */
-  private timestamps: number[] = [];
-  private readonly maxPerMinute = 8;
-  private readonly windowMs = 60_000;
-
   constructor(
     private readonly prisma: PrismaService,
     private readonly pubgBatchService: PubgBatchService,
     private readonly cacheService: PubgCacheService,
+    private readonly rateLimiter: PubgRateLimiterService,
   ) {}
-
-  private async waitForRateLimit(): Promise<void> {
-    const now = Date.now();
-    this.timestamps = this.timestamps.filter((t) => now - t < this.windowMs);
-    if (this.timestamps.length >= this.maxPerMinute) {
-      const oldest = this.timestamps[0];
-      const waitMs = this.windowMs - (now - oldest) + 1000;
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-    this.timestamps.push(Date.now());
-  }
 
   async getSeasonStats(pubgId: string) {
     if (!this.apiKey) throw new Error('PUBG_API_KEY 未配置');
@@ -40,7 +26,7 @@ export class StatsService {
     const accountId = accountIdMap.get(pubgId);
     if (!accountId) throw new NotFoundException('未找到玩家');
 
-    // 2. 获取赛季列表（缓存 24 小时）
+    // 2. 获取赛季列表（缓存 24 小时，带自动重试）
     const cachedSeasons = await this.cacheService.get<{ id: string; isCurrent: boolean }[]>(
       CacheNamespace.SEASON_LIST,
     );
@@ -48,10 +34,12 @@ export class StatsService {
     if (cachedSeasons) {
       seasons = cachedSeasons;
     } else {
-      await this.waitForRateLimit();
-      const seasonsRes = await axios.get(`${this.pubgBase}/seasons`, {
-        headers: { Authorization: `Bearer ${this.apiKey}`, Accept: 'application/vnd.api+json' },
-      });
+      const seasonsRes = await this.rateLimiter.executeWithRetry(
+        () => axios.get(`${this.pubgBase}/seasons`, {
+          headers: { Authorization: `Bearer ${this.apiKey}`, Accept: 'application/vnd.api+json' },
+        }),
+        'SeasonList',
+      );
       seasons = (seasonsRes.data?.data || []).map((s: any) => ({
         id: s.id,
         isCurrent: s.attributes?.isCurrentSeason === true,
