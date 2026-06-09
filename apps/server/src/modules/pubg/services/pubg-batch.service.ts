@@ -225,6 +225,7 @@ export class PubgBatchService {
         );
 
         const statsList = res.data?.data || [];
+        const batchAccountIds = new Set<string>();
         for (const entry of statsList) {
           const accountId = entry.id || '';
           const attributes = entry.attributes || {};
@@ -245,6 +246,7 @@ export class PubgBatchService {
           };
 
           if (accountId) {
+            batchAccountIds.add(accountId);
             const result: SeasonStatsResult = { accountId, stats };
             results.push(result);
             // 写 Redis 缓存
@@ -255,6 +257,18 @@ export class PubgBatchService {
               seasonId,
               accountId,
             );
+          }
+        }
+
+        // 批量 API 可能对部分账号返回空（如赛季无比赛记录），对这些账号走单点兜底
+        const missingIds = uncachedIds.filter((id) => !batchAccountIds.has(id));
+        if (missingIds.length > 0) {
+          this.logger.warn(`[SeasonBatch] 批量 API 未返回 ${missingIds.length} 个账号的数据，启动单点兜底`);
+          for (const id of missingIds) {
+            const retryResult = await this.fetchSingleSeasonStats(id, seasonId, gameMode);
+            if (retryResult) {
+              results.push(retryResult);
+            }
           }
         }
       } catch (err: any) {
