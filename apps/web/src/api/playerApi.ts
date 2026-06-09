@@ -1,5 +1,5 @@
 import api, { type ApiResponse } from './index'
-import type { Player, PlayerStatsDetail, MatchPage, Overview, Match, Teammate } from '@/types'
+import type { Player, PlayerStatsDetail, MatchPage, Overview, Teammate } from '@/types'
 
 export interface User {
   id: string

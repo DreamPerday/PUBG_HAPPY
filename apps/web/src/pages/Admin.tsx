@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Shield, Trash2, Edit3, Save, X, Database, Server, Users, Activity, HardDrive, Clock, Smartphone, ChevronDown, ChevronUp, RefreshCw, Brain, Key, FileText, Eye, EyeOff } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import { useStore } from '@/store/useStore'
 import api from '@/api'
 
 interface AdminUser {
@@ -24,7 +23,6 @@ interface ServerStats {
 
 export default function Admin() {
   const navigate = useNavigate()
-  const currentUser = useStore((s) => s.currentUser)
 
   const [loggedIn, setLoggedIn] = useState(false)
   const [password, setPassword] = useState('')
@@ -135,7 +133,7 @@ export default function Admin() {
         return
       }
 
-      const res = await api.put(`/admin/user/${originalPubgId}`, body)
+      await api.put(`/admin/user/${originalPubgId}`, body)
       setEditingId(null)
       fetchData()
       alert(`修改成功！${body.newPubgId ? 'PUBG ID 已变更，用户需要重新登录才能看到更新。' : '昵称已更新。'}`)

@@ -51,7 +51,7 @@ export default function PlayerDetail() {
     getPlayerMatches(id, currentPage, 20)
       .then((matchData) => {
         setMatches(matchData)
-        setAllMatches((prev) => [...prev, ...(matchData.data || [])])
+        setAllMatches((prev) => [...prev, ...(matchData?.data || [])])
       })
       .finally(() => setLoadingMore(false))
     // eslint-disable-next-line react-hooks/exhaustive-deps
