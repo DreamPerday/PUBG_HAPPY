@@ -673,12 +673,21 @@ export default function GraphPage() {
     try {
       const data = await getWeeklyAnalysis()
       setWeeklyAnalysis(data)
+      // weekly-analysis 会触发 detectRelations，刷新关系数据
+      if (relations.length === 0) {
+        const [relData, playerData] = await Promise.all([
+          getRelations(),
+          getPlayers(),
+        ])
+        setRelations(relData)
+        setPlayers(playerData)
+      }
     } catch {
       // ignore
     } finally {
       setAnalysisLoading(false)
     }
-  }, [])
+  }, [relations.length])
 
   useEffect(() => {
     fetchWeeklyAnalysisData()

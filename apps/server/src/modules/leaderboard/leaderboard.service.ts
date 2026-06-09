@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
 
 /** 获取 ISO 周标识，如 "2026-W24" */
@@ -14,6 +14,8 @@ function getWeekNumber(date: Date = new Date()): string {
 
 @Injectable()
 export class LeaderboardService {
+  private readonly logger = new Logger(LeaderboardService.name);
+
   constructor(private readonly prisma: PrismaService) {}
 
   getCurrentWeek() {
@@ -140,8 +142,39 @@ export class LeaderboardService {
     endOfWeek.setDate(endOfWeek.getDate() + 7);
 
     const users = await this.prisma.user.findMany({
-      include: { matches: { where: { playedAt: { gte: startOfWeek, lte: endOfWeek } } } },
+      select: {
+        id: true,
+        pubgId: true,
+        matches: {
+          where: { playedAt: { gte: startOfWeek, lte: endOfWeek } },
+          select: {
+            kills: true,
+            damage: true,
+            won: true,
+            headshots: true,
+            teamKills: true,
+            survivalTime: true,
+            matchId: true,
+          },
+        },
+      },
     });
+
+    // 如果当前周没有比赛，自动回退到最近有比赛的周
+    const hasMatches = users.some((u) => u.matches.length > 0);
+    if (!hasMatches) {
+      const latestMatch = await this.prisma.match.findFirst({
+        orderBy: { playedAt: 'desc' },
+        select: { playedAt: true },
+      });
+      if (latestMatch) {
+        const fallbackWeek = getWeekNumber(latestMatch.playedAt);
+        if (fallbackWeek !== targetWeek) {
+          return this.recalculateAll(fallbackWeek, teamId);
+        }
+      }
+      return { week: targetWeek, calculated: 0 };
+    }
 
     const entries = [];
     for (const user of users) {

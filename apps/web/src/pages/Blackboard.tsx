@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { Skull, Bomb, Package, Bot, Search } from 'lucide-react'
 import { useStore } from '@/store/useStore'
 import RankTable from '@/components/RankTable'
-import WeekSelector from '@/components/WeekSelector'
+import WeekSelector, { getWeekNumber } from '@/components/WeekSelector'
 
 const categories = [
   { key: '落地成盒王', icon: Skull, desc: '存活时间最短', color: 'text-red-400' },
@@ -14,16 +14,16 @@ const categories = [
 export default function Blackboard() {
   const { blackBoard, boardWeek, boardLoading, fetchBoards } = useStore()
   const [search, setSearch] = useState('')
-  const [selectedWeek, setSelectedWeek] = useState('')
+  const [selectedWeek, setSelectedWeek] = useState(boardWeek || getWeekNumber())
 
   useEffect(() => {
-    if (!selectedWeek) return
     fetchBoards(selectedWeek)
   }, [fetchBoards, selectedWeek])
 
   useEffect(() => {
-    if (!boardWeek) return
-    setSelectedWeek(boardWeek)
+    if (boardWeek && boardWeek !== selectedWeek) {
+      setSelectedWeek(boardWeek)
+    }
   }, [boardWeek])
 
   const handleWeekChange = (week: string) => {

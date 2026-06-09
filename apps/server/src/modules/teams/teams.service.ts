@@ -6,8 +6,8 @@ export class TeamsService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * 自动检测车队：查找同一 match 中出现 >=2 个已注册用户的记录，
-   * 自动创建或更新车队以及队员关系。
+   * 自动检测车队：查找同一 match 中同一队伍（roster）的已注册用户，
+   * 自动创建或更新车队以及队员关系。每支车队最多4人。
    */
   async detectTeams() {
     // 1. 按 matchId 分组，找出包含 >=2 个不同 pubgId 的比赛
@@ -20,6 +20,21 @@ export class TeamsService {
       `;
 
     const results: Array<{ team: any; members: any[]; matchId: string }> = [];
+    const matchIds = rawResults.map((r) => r.match_id);
+
+    // 批量加载 participants
+    const participantRecords = await this.prisma.match.findMany({
+      where: { matchId: { in: matchIds }, participants: { not: null } },
+      select: { matchId: true, participants: true },
+    });
+    const participantsByMatch = new Map<string, any[]>();
+    for (const r of participantRecords) {
+      if (r.participants) {
+        try {
+          participantsByMatch.set(r.matchId, typeof r.participants === 'string' ? JSON.parse(r.participants) : r.participants);
+        } catch { /* ignore */ }
+      }
+    }
 
     for (const row of rawResults) {
       const matchId = row.match_id;
@@ -37,60 +52,80 @@ export class TeamsService {
       });
       if (users.length < 2) continue;
 
-      const userIds = users.map((u) => u.id);
+      const userMap = new Map(users.map((u) => [u.pubgId, u]));
 
-      // 4. 找已存在的车队成员关系
-      const existingMembers = await this.prisma.teamMember.findMany({
-        where: { userId: { in: userIds } },
-        include: { team: true },
-      });
-
-      // 统计每个车队的重叠成员数
-      const overlapMap = new Map<string, number>();
-      for (const member of existingMembers) {
-        overlapMap.set(
-          member.teamId,
-          (overlapMap.get(member.teamId) || 0) + 1,
-        );
-      }
-
-      // 选重叠最多的车队
-      let bestTeamId: string | null = null;
-      let bestOverlap = 0;
-      for (const [teamId, overlap] of overlapMap) {
-        if (overlap > bestOverlap) {
-          bestOverlap = overlap;
-          bestTeamId = teamId;
+      // 4. 按 rosterId 分组
+      const participants = participantsByMatch.get(matchId);
+      const rosterTeams: string[][] = [];
+      if (participants) {
+        const rosterMap = new Map<string, string[]>();
+        for (const p of participants) {
+          const name: string = p.name || '';
+          const rosterId: string = p.rosterId || '';
+          if (!name || !rosterId) continue;
+          if (!userMap.has(name)) continue;
+          if (!rosterMap.has(rosterId)) rosterMap.set(rosterId, []);
+          rosterMap.get(rosterId)!.push(name);
+        }
+        for (const [, names] of rosterMap) {
+          if (names.length >= 2) rosterTeams.push(names);
         }
       }
 
-      let team;
-      if (bestTeamId) {
-        team = await this.prisma.team.findUnique({
-          where: { id: bestTeamId },
-        });
-      }
+      // 若没有 participants 数据则回退到整场比赛
+      const teams = rosterTeams.length > 0 ? rosterTeams : [pubgIds.filter((id) => userMap.has(id))];
 
-      // 5. 没有合适的车队则新建
-      if (!team) {
-        const teamName = users.map((u) => u.nickname).join('、') + '的车队';
-        team = await this.prisma.team.create({
-          data: { name: teamName },
-        });
-      }
+      for (const teamPubgIds of teams) {
+        if (teamPubgIds.length < 2) continue;
+        const teamUsers = teamPubgIds.map((pubgId) => userMap.get(pubgId)!).filter(Boolean);
+        const userIds = teamUsers.map((u) => u.id);
 
-      // 6. 更新/创建队员关系
-      for (const userId of userIds) {
-        await this.prisma.teamMember.upsert({
-          where: {
-            teamId_userId: { teamId: team.id, userId },
-          },
-          update: { matchCount: { increment: 1 } },
-          create: { teamId: team.id, userId, matchCount: 1 },
+        // 5. 找已存在的车队成员关系
+        const existingMembers = await this.prisma.teamMember.findMany({
+          where: { userId: { in: userIds } },
+          include: { team: true },
         });
-      }
 
-      results.push({ team, members: users, matchId });
+        // 统计每个车队的重叠成员数
+        const overlapMap = new Map<string, number>();
+        for (const member of existingMembers) {
+          overlapMap.set(member.teamId, (overlapMap.get(member.teamId) || 0) + 1);
+        }
+
+        // 选重叠最多的车队
+        let bestTeamId: string | null = null;
+        let bestOverlap = 0;
+        for (const [teamId, overlap] of overlapMap) {
+          if (overlap > bestOverlap) {
+            bestOverlap = overlap;
+            bestTeamId = teamId;
+          }
+        }
+
+        let team;
+        if (bestTeamId) {
+          team = await this.prisma.team.findUnique({ where: { id: bestTeamId } });
+        }
+
+        // 6. 没有合适的车队则新建
+        if (!team) {
+          const teamName = teamUsers.map((u) => u.nickname).join('、') + '的车队';
+          team = await this.prisma.team.create({
+            data: { name: teamName },
+          });
+        }
+
+        // 7. 更新/创建队员关系
+        for (const userId of userIds) {
+          await this.prisma.teamMember.upsert({
+            where: { teamId_userId: { teamId: team.id, userId } },
+            update: { matchCount: { increment: 1 } },
+            create: { teamId: team.id, userId, matchCount: 1 },
+          });
+        }
+
+        results.push({ team, members: teamUsers, matchId });
+      }
     }
 
     return results;

@@ -4,7 +4,7 @@ import { useStore } from '@/store/useStore'
 import { getTeamRedBoard } from '@/api/leaderboardApi'
 import RankTable from '@/components/RankTable'
 import RankTableTeam from '@/components/RankTableTeam'
-import WeekSelector from '@/components/WeekSelector'
+import WeekSelector, { getWeekNumber } from '@/components/WeekSelector'
 import Chart from '@/components/Chart'
 import type { LeaderboardEntry, LeaderboardBoard } from '@/types'
 
@@ -27,16 +27,16 @@ export default function Leaderboard() {
   const [refreshing, setRefreshing] = useState(false)
   const [teamBoard, setTeamBoard] = useState<LeaderboardBoard | null>(null)
   const [teamBoardLoading, setTeamBoardLoading] = useState(false)
-  const [selectedWeek, setSelectedWeek] = useState('')
+  const [selectedWeek, setSelectedWeek] = useState(boardWeek || getWeekNumber())
 
   useEffect(() => {
-    if (!selectedWeek) return
     fetchBoards(selectedWeek)
   }, [fetchBoards, selectedWeek])
 
   useEffect(() => {
-    if (!boardWeek) return
-    setSelectedWeek(boardWeek)
+    if (boardWeek && boardWeek !== selectedWeek) {
+      setSelectedWeek(boardWeek)
+    }
   }, [boardWeek])
 
   useEffect(() => {

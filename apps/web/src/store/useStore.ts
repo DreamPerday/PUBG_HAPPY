@@ -102,21 +102,15 @@ export const useStore = create<AppState>((set, get) => ({
   fetchBoards: async (week?: string) => {
     set({ boardLoading: true })
     try {
-      let [red, black, mvp] = await Promise.all([
-        getRedBoard(week),
-        getBlackBoard(week),
-        getMvpBoard(week),
+      // 每次拉取都先重算，确保数据最新（upsert 幂等）
+      const result = await recalculateLeaderboard(week)
+      // 后端可能自动回退到有数据的周
+      const actualWeek = result?.week || week
+      const [red, black, mvp] = await Promise.all([
+        getRedBoard(actualWeek),
+        getBlackBoard(actualWeek),
+        getMvpBoard(actualWeek),
       ])
-      // 如果榜单为空，触发重算后再获取
-      const redEmpty = Object.values(red.boards).every((arr) => arr.length === 0)
-      if (redEmpty) {
-        await recalculateLeaderboard(week)
-        ;[red, black, mvp] = await Promise.all([
-          getRedBoard(week),
-          getBlackBoard(week),
-          getMvpBoard(week),
-        ])
-      }
       set({
         redBoard: red,
         blackBoard: black,

@@ -13,12 +13,32 @@ function getWeekNumber(date: Date = new Date()): string {
   return `${d.getFullYear()}-W${String(weekNum).padStart(2, '0')}`;
 }
 
+/** PUBG API 限流器：最多 8 次/分钟，避免被官方限流 */
+class PubgApiLimiter {
+  private timestamps: number[] = [];
+  private readonly maxPerMinute = 8;
+  private readonly windowMs = 60_000;
+
+  async wait() {
+    const now = Date.now();
+    this.timestamps = this.timestamps.filter((t) => now - t < this.windowMs);
+    if (this.timestamps.length >= this.maxPerMinute) {
+      const oldest = this.timestamps[0];
+      const waitMs = this.windowMs - (now - oldest) + 1000;
+      console.warn(`[PUBG API 限流] 等待 ${Math.round(waitMs / 1000)} 秒`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+    this.timestamps.push(Date.now());
+  }
+}
+
 @Injectable()
 export class SyncService {
   private readonly logger = new Logger(SyncService.name);
   private readonly pubgBase =
     process.env.PUBG_API_BASE || 'https://api.pubg.com/shards/steam';
   private readonly apiKey = process.env.PUBG_API_KEY;
+  private readonly limiter = new PubgApiLimiter();
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -48,6 +68,8 @@ export class SyncService {
           },
         });
       }
+      // 不同用户之间间隔至少 8 秒
+      await new Promise((r) => setTimeout(r, 8000));
     }
     // 同步完成后触发排行榜重算和车队检测
     if (users.length > 0) {
@@ -107,7 +129,8 @@ export class SyncService {
       Accept: 'application/vnd.api+json',
     };
 
-    // Step 1: 通过 pubgId 获取玩家信息（获取 account ID）
+    // Step 1: 查玩家信息
+    await this.limiter.wait();
     const playerRes = await axios.get(`${this.pubgBase}/players`, {
       headers,
       params: { 'filter[playerNames]': pubgId },
@@ -121,7 +144,6 @@ export class SyncService {
     const accountId = playerData.id;
 
     // 从玩家信息的 relationships.matches 中获取比赛列表
-    // 避免调用已废弃的 players/{id}/matches 端点
     const matchRefs: any[] = playerData.relationships?.matches?.data || [];
     const matchIds = matchRefs.map((m: any) => m.id);
 
@@ -129,17 +151,36 @@ export class SyncService {
       `玩家 ${pubgId} 有 ${matchIds.length} 场比赛，开始获取详情...`,
     );
 
-    // Step 3: 批量获取比赛详情（限制最多 50 场）
-    const batch = matchIds.slice(0, 50);
-    const matchDetails: any[] = [];
+    // 跳过已缓存的比赛
+    const existingMatchIds = new Set(
+      (await this.prisma.match.findMany({
+        where: { pubgId, matchId: { in: matchIds.slice(0, 50) } },
+        select: { matchId: true },
+      })).map((m) => m.matchId),
+    );
 
-    // 根据文档：matches 端点不需要 Authorization（不进行速率限制）
+    const batch = matchIds.slice(0, 50).filter((id) => !existingMatchIds.has(id));
+
+    if (batch.length === 0) {
+      this.logger.log(`玩家 ${pubgId} 的比赛已全部缓存，跳过 API 请求`);
+      // 更新 fetchedAt 时间戳
+      await this.prisma.match.updateMany({
+        where: { pubgId },
+        data: { fetchedAt: new Date() },
+      });
+      return { matches: [], accountId };
+    }
+
+    this.logger.log(`玩家 ${pubgId} 需获取 ${batch.length} 场新比赛`);
+
+    const matchDetails: any[] = [];
     const matchHeaders = {
       Accept: 'application/vnd.api+json',
     };
 
     for (const matchId of batch) {
       try {
+        await this.limiter.wait();
         const detailRes = await axios.get(
           `${this.pubgBase}/matches/${matchId}`,
           { headers: matchHeaders },
@@ -147,6 +188,17 @@ export class SyncService {
         matchDetails.push(detailRes.data);
       } catch (err: any) {
         this.logger.warn(`获取比赛 ${matchId} 详情失败: ${err.message}`);
+        if (err.response?.status === 429) {
+          this.logger.warn('触发官方限流，等待后重试...');
+          await new Promise((r) => setTimeout(r, 10000));
+          try {
+            const retryRes = await axios.get(
+              `${this.pubgBase}/matches/${matchId}`,
+              { headers: matchHeaders },
+            );
+            matchDetails.push(retryRes.data);
+          } catch { /* 放弃 */ }
+        }
       }
     }
 
@@ -160,13 +212,11 @@ export class SyncService {
       const matchId = detail.data?.id;
       if (!matchId) continue;
 
-      // 从 included 中查找参与者和队伍信息
       const participants =
         detail.included?.filter(
           (item: any) => item.type === 'participant',
         ) || [];
 
-      // 通过 stats.name（玩家昵称）或 stats.playerId（账号 ID）匹配当前玩家
       let participantStats = null;
       for (const p of participants) {
         const stats = p.attributes?.stats;
@@ -181,18 +231,15 @@ export class SyncService {
       const matchAttrs = detail.data.attributes || {};
       const gameMode = matchAttrs.gameMode || 'unknown';
 
-      // 只采集 squad 模式数据（squad-fpp 也属于 squad）
       if (gameMode !== 'squad' && gameMode !== 'squad-fpp') {
         continue;
       }
 
-      // 提取本局所有参与者数据（包括未注册的）
-      // 先提取 roster（队伍）信息，用于识别同队队友
+      // 提取本局所有参与者数据
       const rosters = detail.included?.filter(
         (item: any) => item.type === 'roster',
       ) || [];
 
-      // 建立 participantId → rosterId 的映射
       const participantRosterMap: Record<string, string> = {};
       for (const roster of rosters) {
         const rosterId = roster.id;

@@ -18,30 +18,28 @@ export class StatsService {
       Accept: 'application/vnd.api+json',
     };
 
-    // 1. 获取玩家 accountId
-    const playerRes = await axios.get(`${this.pubgBase}/players`, {
-      headers,
-      params: { 'filter[playerNames]': pubgId },
-    });
-    const playerData = playerRes.data?.data?.[0];
-    if (!playerData) throw new NotFoundException('未找到玩家');
-    const accountId = playerData.id;
+    try {
+      const playerRes = await axios.get(`${this.pubgBase}/players`, {
+        headers,
+        params: { 'filter[playerNames]': pubgId },
+      });
+      const playerData = playerRes.data?.data?.[0];
+      if (!playerData) throw new NotFoundException('未找到玩家');
+      const accountId = playerData.id;
 
-    // 2. 获取当前赛季 ID
-    const seasonsRes = await axios.get(`${this.pubgBase}/seasons`, { headers });
-    const seasons = seasonsRes.data?.data || [];
-    const currentSeason = seasons.find((s: any) => s.attributes?.isCurrentSeason === true);
-    const seasonId = currentSeason?.id || 'lifetime';
+      const seasonsRes = await axios.get(`${this.pubgBase}/seasons`, { headers });
+      const seasons = seasonsRes.data?.data || [];
+      const currentSeason = seasons.find((s: any) => s.attributes?.isCurrentSeason === true);
+      const seasonId = currentSeason?.id || 'lifetime';
 
-    // 3. 获取赛季统计数据
-    const statsRes = await axios.get(
-      `${this.pubgBase}/players/${accountId}/seasons/${seasonId}`,
-      { headers },
-    );
-    const statsData = statsRes.data?.data?.attributes;
-    const gameModes = statsData?.gameModeStats || {};
+      const statsRes = await axios.get(
+        `${this.pubgBase}/players/${accountId}/seasons/${seasonId}`,
+        { headers },
+      );
+      const statsData = statsRes.data?.data?.attributes;
+      const gameModes = statsData?.gameModeStats || {};
 
-    const extract = (mode: any) => ({
+      const extract = (mode: any) => ({
       roundsPlayed: mode?.roundsPlayed || 0,
       kills: mode?.kills || 0,
       damageDealt: mode?.damageDealt || 0,
@@ -59,21 +57,28 @@ export class StatsService {
     const squadFpp = extract(gameModes['squad-fpp']);
     const totalRounds = squad.roundsPlayed + squadFpp.roundsPlayed;
 
-    return {
-      roundsPlayed: totalRounds,
-      kills: squad.kills + squadFpp.kills,
-      damageDealt: Math.round((squad.damageDealt + squadFpp.damageDealt) * 100) / 100,
-      wins: squad.wins + squadFpp.wins,
-      headshotKills: squad.headshotKills + squadFpp.headshotKills,
-      assists: squad.assists + squadFpp.assists,
-      revives: squad.revives + squadFpp.revives,
-      longestKill: Math.max(squad.longestKill, squadFpp.longestKill),
-      bestRank: Math.min(squad.bestRank, squadFpp.bestRank),
-      avgKills: totalRounds > 0 ? Math.round(((squad.kills + squadFpp.kills) / totalRounds) * 100) / 100 : 0,
-      avgDamage: totalRounds > 0 ? Math.round(((squad.damageDealt + squadFpp.damageDealt) / totalRounds) * 100) / 100 : 0,
-      winRate: totalRounds > 0 ? Math.round(((squad.wins + squadFpp.wins) / totalRounds) * 10000) / 10000 : 0,
-      seasonId,
-    };
+      return {
+        roundsPlayed: totalRounds,
+        kills: squad.kills + squadFpp.kills,
+        damageDealt: Math.round((squad.damageDealt + squadFpp.damageDealt) * 100) / 100,
+        wins: squad.wins + squadFpp.wins,
+        headshotKills: squad.headshotKills + squadFpp.headshotKills,
+        assists: squad.assists + squadFpp.assists,
+        revives: squad.revives + squadFpp.revives,
+        longestKill: Math.max(squad.longestKill, squadFpp.longestKill),
+        bestRank: Math.min(squad.bestRank, squadFpp.bestRank),
+        avgKills: totalRounds > 0 ? Math.round(((squad.kills + squadFpp.kills) / totalRounds) * 100) / 100 : 0,
+        avgDamage: totalRounds > 0 ? Math.round(((squad.damageDealt + squadFpp.damageDealt) / totalRounds) * 100) / 100 : 0,
+        winRate: totalRounds > 0 ? Math.round(((squad.wins + squadFpp.wins) / totalRounds) * 10000) / 10000 : 0,
+        seasonId,
+      };
+    } catch (err: any) {
+      if (err.response?.status === 429) {
+        this.logger.warn(`PUBG API 限流，赛季统计暂时不可用`);
+        return null;
+      }
+      throw err;
+    }
   }
 
   async getOverview() {
@@ -139,6 +144,16 @@ export class StatsService {
 
     const bestMatch = await this.prisma.match.findFirst({
       where: { pubgId },
+      select: {
+        id: true,
+        matchId: true,
+        kills: true,
+        damage: true,
+        rank: true,
+        won: true,
+        mapName: true,
+        playedAt: true,
+      },
       orderBy: [{ kills: 'desc' }, { damage: 'desc' }],
     });
 

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Crown, Star, Medal, Trophy } from 'lucide-react'
 import { useStore } from '@/store/useStore'
-import WeekSelector from '@/components/WeekSelector'
+import WeekSelector, { getWeekNumber } from '@/components/WeekSelector'
 import Chart from '@/components/Chart'
 
 const medalColors = ['text-pubg-yellow', 'text-gray-300', 'text-amber-600']
@@ -9,16 +9,16 @@ const medalColors = ['text-pubg-yellow', 'text-gray-300', 'text-amber-600']
 export default function MVP() {
   const state = useStore()
   const { mvpBoard, boardWeek, boardLoading } = state
-  const [selectedWeek, setSelectedWeek] = useState('')
+  const [selectedWeek, setSelectedWeek] = useState(boardWeek || getWeekNumber())
 
   useEffect(() => {
-    if (!selectedWeek) return
     state.fetchBoards(selectedWeek)
   }, [selectedWeek])
 
   useEffect(() => {
-    if (!boardWeek) return
-    setSelectedWeek(boardWeek)
+    if (boardWeek && boardWeek !== selectedWeek) {
+      setSelectedWeek(boardWeek)
+    }
   }, [boardWeek])
 
   const handleWeekChange = (week: string) => {

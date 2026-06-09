@@ -150,6 +150,42 @@ export class AdminService {
     });
   }
 
+  async cleanupUnregistered() {
+    // 删除所有没有比赛记录的注册用户（误注册）
+    const users = await this.prisma.user.findMany({
+      select: { id: true, pubgId: true, _count: { select: { matches: true } } },
+    });
+    const toDelete = users.filter((u) => u._count.matches === 0);
+    let deleted = 0;
+    for (const user of toDelete) {
+      await this.prisma.leaderboard.deleteMany({ where: { userId: user.id } });
+      await this.prisma.teamMember.deleteMany({ where: { userId: user.id } });
+      await this.prisma.playerStats.deleteMany({ where: { playerId: user.id } });
+      await this.prisma.user.delete({ where: { id: user.id } });
+      deleted++;
+    }
+    return { success: true, message: `已清理 ${deleted} 名误注册用户`, deleted };
+  }
+
+  async resetDatabase() {
+    // 按外键依赖顺序清空所有表
+    await this.prisma.matchTelemetry.deleteMany();
+    await this.prisma.danmaku.deleteMany();
+    await this.prisma.comment.deleteMany();
+    await this.prisma.weeklyReport.deleteMany();
+    await this.prisma.leaderboard.deleteMany();
+    await this.prisma.teamMember.deleteMany();
+    await this.prisma.teamGraphCluster.deleteMany();
+    await this.prisma.playerRelation.deleteMany();
+    await this.prisma.playerStats.deleteMany();
+    await this.prisma.syncLog.deleteMany();
+    await this.prisma.match.deleteMany();
+    await this.prisma.team.deleteMany();
+    await this.prisma.user.deleteMany();
+
+    return { success: true, message: '所有数据已清空，请重新同步玩家数据' };
+  }
+
   async getConfig(key: string) {
     const config = await this.prisma.systemConfig.findUnique({ where: { key } });
     return config ? config.value : null;

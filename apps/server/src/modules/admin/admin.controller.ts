@@ -67,6 +67,18 @@ export class AdminController {
     return this.adminService.updateUser(pubgId, body);
   }
 
+  @Post('cleanup-unregistered')
+  @ApiOperation({ summary: '清理无比赛记录的误注册用户' })
+  cleanupUnregistered() {
+    return this.adminService.cleanupUnregistered();
+  }
+
+  @Post('reset')
+  @ApiOperation({ summary: '清空所有数据（用户、比赛、榜单等），仅保留系统配置' })
+  resetDatabase() {
+    return this.adminService.resetDatabase();
+  }
+
   @Get('config')
   @ApiOperation({ summary: '获取所有系统配置' })
   getAllConfigs() {

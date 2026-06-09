@@ -132,6 +132,7 @@ export class GraphService {
       where: this.pubgIdNotDemo(),
     });
 
+    // 按 matchId 分组
     const matchGroups = new Map<string, Array<{ pubgId: string; playedAt: Date }>>();
     for (const m of allMatches) {
       if (!pubgIds.includes(m.pubgId)) continue;
@@ -147,26 +148,60 @@ export class GraphService {
       playerMatchCounts.set(user.pubgId, 0);
     }
 
-    for (const [, players] of matchGroups) {
+    // 批量加载有多个注册用户的比赛的 participants
+    const matchIdsWithMultiUsers = [...matchGroups.entries()]
+      .filter(([, players]) => [...new Set(players.map((p) => p.pubgId))].filter((id) => pubgIds.includes(id)).length >= 2)
+      .map(([matchId]) => matchId);
+
+    const participantsMap = new Map<string, any[]>();
+    if (matchIdsWithMultiUsers.length > 0) {
+      const matchesWithParticipants = await this.prisma.match.findMany({
+        where: { matchId: { in: matchIdsWithMultiUsers }, participants: { not: null } },
+        select: { matchId: true, participants: true },
+      });
+      for (const m of matchesWithParticipants) {
+        if (m.participants) {
+          try {
+            participantsMap.set(m.matchId, typeof m.participants === 'string' ? JSON.parse(m.participants) : m.participants);
+          } catch { /* ignore parse errors */ }
+        }
+      }
+    }
+
+    for (const [matchId, players] of matchGroups) {
       const uniquePlayers = [...new Set(players.map((p) => p.pubgId))].filter(
         (id) => pubgIds.includes(id),
       );
       if (uniquePlayers.length < 2) continue;
 
-      for (const p of uniquePlayers) {
-        playerMatchCounts.set(p, (playerMatchCounts.get(p) || 0) + 1);
-      }
+      // 尝试从 participants 按 rosterId 分组
+      const rosterGroups = this.getRosterGroups(matchId, participantsMap, uniquePlayers, pubgIds);
 
-      for (let i = 0; i < uniquePlayers.length; i++) {
-        for (let j = i + 1; j < uniquePlayers.length; j++) {
-          const a = uniquePlayers[i];
-          const b = uniquePlayers[j];
-          const key = a < b ? `${a}:${b}` : `${b}:${a}`;
-          const existing = relationMap.get(key) || { together: 0, lastPlayed: new Date(0) };
-          existing.together++;
-          const playedAt = players[0].playedAt;
-          if (playedAt > existing.lastPlayed) existing.lastPlayed = playedAt;
-          relationMap.set(key, existing);
+      // 统计每个玩家在该匹配中的出场
+      const playSet = new Set(uniquePlayers);
+
+      // 按 roster 分组处理（若无 participants 数据则回退到整场比赛所有注册玩家）
+      const groups = rosterGroups.length > 0 ? rosterGroups : [uniquePlayers];
+
+      for (const group of groups) {
+        if (group.length < 2) continue;
+
+        // 该 roster 的玩家计为一次出场
+        for (const p of group) {
+          playerMatchCounts.set(p, (playerMatchCounts.get(p) || 0) + 1);
+        }
+
+        for (let i = 0; i < group.length; i++) {
+          for (let j = i + 1; j < group.length; j++) {
+            const a = group[i];
+            const b = group[j];
+            const key = a < b ? `${a}:${b}` : `${b}:${a}`;
+            const existing = relationMap.get(key) || { together: 0, lastPlayed: new Date(0) };
+            existing.together++;
+            const playedAt = players[0].playedAt;
+            if (playedAt > existing.lastPlayed) existing.lastPlayed = playedAt;
+            relationMap.set(key, existing);
+          }
         }
       }
     }
@@ -202,6 +237,33 @@ export class GraphService {
 
     this.logger.log(`关系检测完成，共更新 ${count} 对关系`);
     return { message: `关系检测完成，共更新 ${count} 对关系`, count };
+  }
+
+  /** 从 participants 中按 rosterId 分组，返回每组玩家 pubgId 列表 */
+  private getRosterGroups(
+    matchId: string,
+    participantsMap: Map<string, any[]>,
+    uniquePlayers: string[],
+    allPubgIds: string[],
+  ): string[][] {
+    const participants = participantsMap.get(matchId);
+    if (!participants) return [];
+
+    const playerSet = new Set(uniquePlayers);
+    const rosterMap = new Map<string, string[]>();
+
+    for (const p of participants) {
+      const name: string = p.name || '';
+      const rosterId: string = p.rosterId || '';
+      if (!name || !rosterId) continue;
+      if (!playerSet.has(name)) continue;
+
+      if (!rosterMap.has(rosterId)) rosterMap.set(rosterId, []);
+      rosterMap.get(rosterId)!.push(name);
+    }
+
+    const result = [...rosterMap.values()].filter((g) => g.length >= 2);
+    return result;
   }
 
   async clusterTeams() {
@@ -241,13 +303,15 @@ export class GraphService {
       const queue = [node];
       while (queue.length > 0) {
         const current = queue.shift()!;
-        if (visited.has(current)) continue;
+        if (visited.has(current) || cluster.has(current)) continue;
         visited.add(current);
         cluster.add(current);
+        // 一支车队最多4人
+        if (cluster.size >= 4) continue;
         const neighbors = graph.get(current);
         if (neighbors) {
           for (const n of neighbors) {
-            if (!visited.has(n)) queue.push(n);
+            if (!visited.has(n) && !cluster.has(n)) queue.push(n);
           }
         }
       }

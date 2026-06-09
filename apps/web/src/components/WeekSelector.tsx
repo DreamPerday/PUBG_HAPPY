@@ -1,6 +1,6 @@
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 
-function getWeekNumber(date: Date = new Date()): string {
+export function getWeekNumber(date: Date = new Date()): string {
   const d = new Date(date.getTime())
   d.setHours(0, 0, 0, 0)
   d.setDate(d.getDate() + 3 - (d.getDay() + 6) % 7)
