@@ -9,8 +9,8 @@ export class PubgRateLimiterService {
   private readonly windowMs = 60_000;
 
   constructor(private readonly configService: ConfigService) {
-    // 允许通过配置覆盖限流值，默认 8 次/分钟
-    this.maxPerMinute = this.configService.get<number>('pubg.rateLimitPerMinute') || 8;
+    // 允许通过配置覆盖限流值，默认 10 次/分钟（PUBG 官方默认值）
+    this.maxPerMinute = this.configService.get<number>('pubg.rateLimitPerMinute') || 10;
   }
 
   /**

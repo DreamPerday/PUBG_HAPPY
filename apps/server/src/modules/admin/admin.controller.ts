@@ -52,6 +52,13 @@ export class AdminController {
     }
   }
 
+  @Post('sync-all')
+  @ApiOperation({ summary: '一键同步所有用户数据（含赛季数据）' })
+  async syncAll() {
+    this.logger.log('管理员触发全员数据同步');
+    return this.adminService.syncAllUsers();
+  }
+
   @Delete('user/:pubgId')
   @ApiOperation({ summary: '删除用户' })
   deleteUser(@Param('pubgId') pubgId: string) {

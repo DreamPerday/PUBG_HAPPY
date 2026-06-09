@@ -301,16 +301,26 @@ export class SyncService {
 
     for (const matchId of batch) {
       try {
-        const detailRes = await this.rateLimiter.executeWithRetry(
-          () => axios.get(
-            `${this.pubgBase}/matches/${matchId}`,
-            { headers: matchHeaders },
-          ),
-          `MatchDetail(${matchId.slice(0, 8)}...)`,
+        // /matches 端点不限流（PUBG 官方文档说明），直接请求
+        const detailRes = await axios.get(
+          `${this.pubgBase}/matches/${matchId}`,
+          { headers: matchHeaders },
         );
-        matchDetails.push(detailRes);
+        matchDetails.push(detailRes.data);
       } catch (err: any) {
         this.logger.warn(`获取比赛 ${matchId} 详情失败: ${err.message}`);
+        // 网络错误时简单重试一次
+        if (!err.response || err.response?.status >= 500) {
+          try {
+            await new Promise((r) => setTimeout(r, 2000));
+            const retryRes = await axios.get(
+              `${this.pubgBase}/matches/${matchId}`,
+              { headers: matchHeaders },
+            );
+            matchDetails.push(retryRes.data);
+            continue;
+          } catch { /* 放弃 */ }
+        }
       }
     }
 

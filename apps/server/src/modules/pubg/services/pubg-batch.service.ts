@@ -274,7 +274,7 @@ export class PubgBatchService {
   }
 
   /** 兜底：单个玩家赛季数据（用于批处理失败时的降级，带自动重试确保障终能获取） */
-  private async fetchSingleSeasonStats(
+  async fetchSingleSeasonStats(
     accountId: string,
     seasonId: string,
     gameMode: string,
@@ -310,6 +310,52 @@ export class PubgBatchService {
     } catch (err: any) {
       this.logger.warn(`[SeasonBatch] 单点兜底获取 ${accountId} 赛季数据失败: ${err.message}`);
       return null;
+    }
+  }
+
+  /**
+   * 获取并缓存指定玩家的完整赛季数据（squad + squad-fpp）
+   * 自动获取当前赛季 ID（优先使用缓存），结果写入 Redis 缓存
+   * 注册/绑定时调用，减少后续 API 请求次数
+   */
+  async fetchAndCacheSeasonData(accountId: string, pubgId: string): Promise<void> {
+    try {
+      // 1. 获取当前赛季 ID（优先缓存）
+      const cachedSeasons = await this.cacheService.get<{ id: string; isCurrent: boolean }[]>(
+        CacheNamespace.SEASON_LIST,
+      );
+      let seasonId: string;
+      if (cachedSeasons) {
+        const current = cachedSeasons.find((s) => s.isCurrent);
+        seasonId = current?.id || 'lifetime';
+      } else {
+        // 缓存未命中，调用 API 获取赛季列表
+        const res = await this.rateLimiter.executeWithRetry(
+          () => axios.get(`${this.pubgBase}/seasons`, { headers: this.getHeaders() }),
+          'SeasonList(fetchAndCache)',
+        );
+        const seasons = (res.data?.data || []).map((s: any) => ({
+          id: s.id,
+          isCurrent: s.attributes?.isCurrentSeason === true,
+        }));
+        const current = seasons.find((s) => s.isCurrent);
+        seasonId = current?.id || 'lifetime';
+        await this.cacheService.set(CacheNamespace.SEASON_LIST, seasons, 86400);
+      }
+
+      // 2. 获取 squad 模式赛季数据（自动走缓存，若已有则跳过 API 调用）
+      const squadResult = await this.fetchSingleSeasonStats(accountId, seasonId, 'squad');
+      if (squadResult) {
+        this.logger.log(`[SeasonData] ${pubgId} squad 赛季数据已缓存`);
+      }
+
+      // 3. 获取 squad-fpp 模式赛季数据
+      const fppResult = await this.fetchSingleSeasonStats(accountId, seasonId, 'squad-fpp');
+      if (fppResult) {
+        this.logger.log(`[SeasonData] ${pubgId} squad-fpp 赛季数据已缓存`);
+      }
+    } catch (err: any) {
+      this.logger.warn(`[SeasonData] 获取 ${pubgId} 赛季数据失败: ${err.message}`);
     }
   }
 

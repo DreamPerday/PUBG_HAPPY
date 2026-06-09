@@ -1,13 +1,20 @@
-import { Injectable, HttpException, HttpStatus } from '@nestjs/common';
+import { Injectable, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
+import { SyncService } from '../sync/sync.service';
+import { PubgBatchService } from '../pubg/services/pubg-batch.service';
 import * as fs from 'fs';
 import * as os from 'os';
 
 @Injectable()
 export class AdminService {
+  private readonly logger = new Logger(AdminService.name);
   private startTime = Date.now();
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly syncService: SyncService,
+    private readonly pubgBatchService: PubgBatchService,
+  ) {}
 
   async getUsers() {
     const users = await this.prisma.user.findMany({
@@ -148,6 +155,62 @@ export class AdminService {
         avgSurvivalTime, bestRank, kda, winRate,
       },
     });
+  }
+
+  /**
+   * 一键同步所有用户数据（比赛 + 赛季统计）
+   * 确保：1) 赛季数据能查询到  2) 每个用户数据完整  3) 出错不阻断整体流程
+   */
+  async syncAllUsers(): Promise<{
+    total: number;
+    synced: number;
+    failed: number;
+    seasonStats: number;
+    details: Array<{ pubgId: string; nickname: string; matchResult: string; seasonResult: string }>;
+  }> {
+    const users = await this.prisma.user.findMany({ select: { pubgId: true, nickname: true, accountId: true } });
+    const details: Array<{ pubgId: string; nickname: string; matchResult: string; seasonResult: string }> = [];
+    let synced = 0;
+    let failed = 0;
+    let seasonStats = 0;
+
+    this.logger.log(`全员同步开始，共 ${users.length} 个用户`);
+
+    for (const [index, user] of users.entries()) {
+      this.logger.log(`[${index + 1}/${users.length}] 同步 ${user.pubgId}(${user.nickname})...`);
+
+      let matchResult = '跳过';
+      let seasonResult = '跳过';
+
+      try {
+        // 1. 同步比赛数据
+        const syncR = await this.syncService.syncPlayerMatches(user.pubgId, user.accountId);
+        matchResult = `新增 ${syncR.synced} 场比赛${syncR.cached ? '(缓存)' : ''}`;
+        this.logger.log(`  [${user.pubgId}] 比赛: ${matchResult}`);
+
+        // 2. 如果有 accountId，拉取赛季数据并缓存
+        if (user.accountId) {
+          await this.pubgBatchService.fetchAndCacheSeasonData(user.accountId, user.pubgId);
+          seasonResult = '赛季数据已缓存';
+          seasonStats++;
+          this.logger.log(`  [${user.pubgId}] 赛季: ${seasonResult}`);
+        }
+
+        // 3. 重算玩家统计
+        await this.recalcUserStats(user.pubgId);
+
+        synced++;
+        details.push({ pubgId: user.pubgId, nickname: user.nickname, matchResult, seasonResult });
+      } catch (err: any) {
+        failed++;
+        const errMsg = err.message || '未知错误';
+        this.logger.error(`  [${user.pubgId}] 同步失败: ${errMsg}`);
+        details.push({ pubgId: user.pubgId, nickname: user.nickname, matchResult: `失败: ${errMsg}`, seasonResult });
+      }
+    }
+
+    this.logger.log(`全员同步完成: 成功 ${synced}, 失败 ${failed}, 赛季数据 ${seasonStats}`);
+    return { total: users.length, synced, failed, seasonStats, details };
   }
 
   async cleanupUnregistered() {
