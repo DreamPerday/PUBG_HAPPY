@@ -43,6 +43,8 @@ export class AdminController {
     try {
       await this.syncService.syncPlayerMatches(pubgId);
       await this.adminService.recalcUserStats(pubgId);
+      // 同步后更新车队检测
+      await this.syncService.detectTeamsFromMatches();
       return { message: `用户 ${pubgId} 同步完成，请刷新页面查看` };
     } catch (err: any) {
       const msg = err.response?.status === 404
@@ -66,12 +68,12 @@ export class AdminController {
   }
 
   @Put('user/:pubgId')
-  @ApiOperation({ summary: '修改用户信息' })
+  @ApiOperation({ summary: '修改用户信息（自动同步数据及更新车队检测）' })
   updateUser(
     @Param('pubgId') pubgId: string,
     @Body() body: { nickname?: string; newPubgId?: string },
   ) {
-    return this.adminService.updateUser(pubgId, body);
+    return this.adminService.updateUserAndSync(pubgId, body);
   }
 
   @Post('cleanup-unregistered')

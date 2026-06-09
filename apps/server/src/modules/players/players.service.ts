@@ -127,6 +127,9 @@ export class PlayersService {
     }
 
     this.logger.log(`新用户 ${pubgId}(${nickname}) 数据初始化完成`);
+
+    // 更新车队检测
+    await this.syncService.detectTeamsFromMatches();
   }
 
   async updateAvatar(userId: string, avatar: string) {

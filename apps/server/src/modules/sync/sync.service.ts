@@ -506,7 +506,7 @@ export class SyncService {
     }
   }
 
-  private async detectTeamsFromMatches() {
+  async detectTeamsFromMatches() {
     const rawResults: Array<{ match_id: string; player_count: number }> =
       await this.prisma.$queryRaw`
         SELECT match_id, COUNT(DISTINCT pubg_id) AS player_count

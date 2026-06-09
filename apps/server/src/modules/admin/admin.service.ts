@@ -209,8 +209,32 @@ export class AdminService {
       }
     }
 
+    // 全员同步完成后，更新车队检测和排行榜
+    try {
+      await this.syncService.detectTeamsFromMatches();
+      this.logger.log('全员同步完成: 车队检测已更新');
+    } catch (err: any) {
+      this.logger.error(`全员同步后车队检测失败: ${err.message}`);
+    }
+
     this.logger.log(`全员同步完成: 成功 ${synced}, 失败 ${failed}, 赛季数据 ${seasonStats}`);
     return { total: users.length, synced, failed, seasonStats, details };
+  }
+
+  /** 修改用户信息后同步数据并更新车队检测 */
+  async updateUserAndSync(pubgId: string, body: { nickname?: string; newPubgId?: string }) {
+    const result = await this.updateUser(pubgId, body);
+    // 如果换了 PUBG ID，触发数据同步和车队检测
+    if (body.newPubgId) {
+      try {
+        await this.syncService.syncPlayerMatches(body.newPubgId);
+        await this.recalcUserStats(body.newPubgId);
+        await this.syncService.detectTeamsFromMatches();
+      } catch (err: any) {
+        this.logger.error(`修改 ID 后同步失败: ${err.message}`);
+      }
+    }
+    return result;
   }
 
   async cleanupUnregistered() {

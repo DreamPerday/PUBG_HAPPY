@@ -49,6 +49,10 @@ export class AuthService {
     if (user) {
       await this.syncService['recalcPlayerStats'](pubgId);
     }
+
+    // 更新车队检测
+    await this.syncService.detectTeamsFromMatches();
+
     this.logger.log(`新用户 ${pubgId} 数据初始化完成`);
   }
 }
