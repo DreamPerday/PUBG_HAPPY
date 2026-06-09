@@ -23,6 +23,10 @@ export class PubgBatchService {
   private readonly pubgBase: string;
   private readonly apiKey: string;
 
+  /** 内存缓存：赛季列表（Redis 不可用时降级使用） */
+  private static seasonListCache: { seasons: { id: string; isCurrent: boolean }[]; fetchedAt: number } | null = null;
+  private static readonly SEASON_LIST_TTL = 3600_000; // 1 小时
+
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
@@ -328,34 +332,56 @@ export class PubgBatchService {
   }
 
   /**
+   * 获取当前赛季 ID
+   * 缓存优先级：内存（1小时） > Redis（24小时） > PUBG API
+   * Redis 不可用时也不会重复调 API
+   */
+  private async getCurrentSeasonId(): Promise<string> {
+    // 1. 内存缓存
+    const now = Date.now();
+    if (PubgBatchService.seasonListCache && (now - PubgBatchService.seasonListCache.fetchedAt) < PubgBatchService.SEASON_LIST_TTL) {
+      const current = PubgBatchService.seasonListCache.seasons.find((s) => s.isCurrent);
+      return current?.id || 'lifetime';
+    }
+
+    // 2. Redis 缓存
+    const cachedSeasons = await this.cacheService.get<{ id: string; isCurrent: boolean }[]>(
+      CacheNamespace.SEASON_LIST,
+    );
+    if (cachedSeasons) {
+      PubgBatchService.seasonListCache = { seasons: cachedSeasons, fetchedAt: now };
+      const current = cachedSeasons.find((s) => s.isCurrent);
+      return current?.id || 'lifetime';
+    }
+
+    // 3. 调 API
+    const res = await this.rateLimiter.executeWithRetry(
+      () => axios.get(`${this.pubgBase}/seasons`, { headers: this.getHeaders() }),
+      'SeasonList',
+    );
+    const seasons = (res.data?.data || []).map((s: any) => ({
+      id: s.id,
+      isCurrent: s.attributes?.isCurrentSeason === true,
+    }));
+    const current = seasons.find((s) => s.isCurrent);
+    const seasonId = current?.id || 'lifetime';
+
+    // 写入两级缓存
+    PubgBatchService.seasonListCache = { seasons, fetchedAt: now };
+    await this.cacheService.set(CacheNamespace.SEASON_LIST, seasons, 86400);
+
+    return seasonId;
+  }
+
+  /**
    * 获取并缓存指定玩家的完整赛季数据（squad + squad-fpp）
    * 自动获取当前赛季 ID（优先使用缓存），结果写入 Redis 缓存
    * 注册/绑定时调用，减少后续 API 请求次数
    */
   async fetchAndCacheSeasonData(accountId: string, pubgId: string): Promise<void> {
     try {
-      // 1. 获取当前赛季 ID（优先缓存）
-      const cachedSeasons = await this.cacheService.get<{ id: string; isCurrent: boolean }[]>(
-        CacheNamespace.SEASON_LIST,
-      );
-      let seasonId: string;
-      if (cachedSeasons) {
-        const current = cachedSeasons.find((s) => s.isCurrent);
-        seasonId = current?.id || 'lifetime';
-      } else {
-        // 缓存未命中，调用 API 获取赛季列表
-        const res = await this.rateLimiter.executeWithRetry(
-          () => axios.get(`${this.pubgBase}/seasons`, { headers: this.getHeaders() }),
-          'SeasonList(fetchAndCache)',
-        );
-        const seasons = (res.data?.data || []).map((s: any) => ({
-          id: s.id,
-          isCurrent: s.attributes?.isCurrentSeason === true,
-        }));
-        const current = seasons.find((s) => s.isCurrent);
-        seasonId = current?.id || 'lifetime';
-        await this.cacheService.set(CacheNamespace.SEASON_LIST, seasons, 86400);
-      }
+      // 1. 获取当前赛季 ID（内存 → Redis → API，不会重复调用）
+      const seasonId = await this.getCurrentSeasonId();
 
       // 2. 获取 squad 模式赛季数据（自动走缓存，若已有则跳过 API 调用）
       const squadResult = await this.fetchSingleSeasonStats(accountId, seasonId, 'squad');
