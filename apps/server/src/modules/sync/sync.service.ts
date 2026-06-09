@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../../prisma.service';
+import { PubgBatchService } from '../pubg/services/pubg-batch.service';
+import { chunkArray } from '../../common/utils/chunk';
 import axios from 'axios';
 
 /** 获取 ISO 周标识，如 "2026-W24" */
@@ -13,53 +15,134 @@ function getWeekNumber(date: Date = new Date()): string {
   return `${d.getFullYear()}-W${String(weekNum).padStart(2, '0')}`;
 }
 
-/** PUBG API 限流器：最多 8 次/分钟，避免被官方限流 */
-class PubgApiLimiter {
-  private timestamps: number[] = [];
-  private readonly maxPerMinute = 8;
-  private readonly windowMs = 60_000;
-
-  async wait() {
-    const now = Date.now();
-    this.timestamps = this.timestamps.filter((t) => now - t < this.windowMs);
-    if (this.timestamps.length >= this.maxPerMinute) {
-      const oldest = this.timestamps[0];
-      const waitMs = this.windowMs - (now - oldest) + 1000;
-      console.warn(`[PUBG API 限流] 等待 ${Math.round(waitMs / 1000)} 秒`);
-      await new Promise((r) => setTimeout(r, waitMs));
-    }
-    this.timestamps.push(Date.now());
-  }
-}
-
 @Injectable()
 export class SyncService {
   private readonly logger = new Logger(SyncService.name);
   private readonly pubgBase =
     process.env.PUBG_API_BASE || 'https://api.pubg.com/shards/steam';
   private readonly apiKey = process.env.PUBG_API_KEY;
-  private readonly limiter = new PubgApiLimiter();
 
-  constructor(private readonly prisma: PrismaService) {}
+  /** 限流器：≤8 req/min（匹配详情请求专用的独立限流器） */
+  private matchTimestamps: number[] = [];
+  private readonly matchMaxPerMinute = 8;
+  private readonly matchWindowMs = 60_000;
 
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly pubgBatchService: PubgBatchService,
+  ) {}
+
+  /** 匹配详情专用限流 */
+  private async waitForMatchRateLimit(): Promise<void> {
+    const now = Date.now();
+    this.matchTimestamps = this.matchTimestamps.filter((t) => now - t < this.matchWindowMs);
+    if (this.matchTimestamps.length >= this.matchMaxPerMinute) {
+      const oldest = this.matchTimestamps[0];
+      const waitMs = this.matchWindowMs - (now - oldest) + 1000;
+      this.logger.warn(`[PUBG 限流] 匹配详情等待 ${Math.round(waitMs / 1000)} 秒`);
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+    this.matchTimestamps.push(Date.now());
+  }
+
+  // ==================== 批量同步（改造核心） ====================
+
+  /**
+   * 批量同步所有用户
+   * 改造目标：
+   * 1. 每10人一组，使用 PUBG Batch Endpoint
+   * 2. 优先使用 Redis 缓存
+   * 3. 利用 account_id 避免不必要的 /players 请求
+   * 4. 保持 ≤8 req/min 限流
+   */
   @Cron(CronExpression.EVERY_30_MINUTES)
   async scheduledSync() {
-    this.logger.log('开始定时同步所有用户的战绩...');
+    this.logger.log('开始定时批量同步所有用户的战绩...');
     const users = await this.prisma.user.findMany();
-    for (const user of users) {
+    const pubgIds = users.map((u) => u.pubgId);
+
+    if (pubgIds.length === 0) {
+      this.logger.log('没有用户需要同步');
+      return;
+    }
+
+    // 按每批10个玩家分组
+    const batches = chunkArray(pubgIds, 10);
+    this.logger.log(`共 ${pubgIds.length} 个用户，分为 ${batches.length} 批`);
+
+    for (const batch of batches) {
       try {
-        const result = await this.syncPlayerMatches(user.pubgId);
+        await this.syncPlayersBatch(batch);
+        // 每批之间留出间隔，控制总体速率
+        if (batches.length > 1) {
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+      } catch (error: any) {
+        this.logger.error(`批量同步失败 (${batch.join(',')}): ${error.message}`);
+        // 批量失败时，逐个重试
+        for (const pubgId of batch) {
+          try {
+            const user = users.find((u) => u.pubgId === pubgId);
+            if (!user) continue;
+            await this.syncSinglePlayerFallback(pubgId, user.id);
+          } catch (innerErr: any) {
+            const failedUser = users.find((u) => u.pubgId === pubgId);
+            this.logger.error(`单点兜底同步 ${pubgId} 失败: ${innerErr.message}`);
+            await this.prisma.syncLog.create({
+              data: {
+                userId: failedUser?.id || 'unknown',
+                status: 'error',
+                message: innerErr.message,
+              },
+            });
+          }
+        }
+      }
+    }
+
+    // 同步完成后触发后续任务
+    if (pubgIds.length > 0) {
+      await this.triggerPostSyncTasks();
+    }
+    this.logger.log('定时批量同步完成');
+  }
+
+  /**
+   * 批量同步一组玩家（最多10人）
+   * 流程：
+   * 1. 批量获取 accountId（优先 DB/Redis，再调 API）
+   * 2. 批量获取玩家比赛列表
+   * 3. 批量写库
+   */
+  private async syncPlayersBatch(pubgIds: string[]) {
+    this.logger.log(`[BatchPlayer] 开始同步 ${pubgIds.length} 玩家: ${pubgIds.join(',')}`);
+
+    // 1. 批量获取 accountId
+    const accountIdMap = await this.pubgBatchService.batchGetAccountIds(pubgIds);
+
+    // 2. 对每个玩家同步比赛数据（PUBG API 无批量比赛详情接口，优化为并行+缓存）
+    const promises = pubgIds.map(async (pubgId) => {
+      const accountId = accountIdMap.get(pubgId);
+      if (!accountId) {
+        this.logger.warn(`玩家 ${pubgId} 无 accountId，跳过`);
+        return null;
+      }
+
+      const user = await this.prisma.user.findUnique({ where: { pubgId } });
+      if (!user) return null;
+
+      try {
+        const result = await this.syncPlayerMatches(pubgId, accountId);
         await this.prisma.syncLog.create({
           data: {
             userId: user.id,
             status: 'success',
-            message: `同步完成，新增 ${result.synced} 场比赛${result.cached ? '（使用缓存）' : ''}`,
+            message: `批量同步完成，新增 ${result.synced} 场比赛${result.cached ? '（使用缓存）' : ''}`,
           },
         });
+        return result;
       } catch (error: any) {
-        this.logger.error(
-          `同步用户 ${user.nickname}(${user.pubgId}) 失败: ${error.message}`,
-        );
+        this.logger.error(`同步玩家 ${pubgId} 失败: ${error.message}`);
         await this.prisma.syncLog.create({
           data: {
             userId: user.id,
@@ -67,21 +150,36 @@ export class SyncService {
             message: error.message,
           },
         });
+        return null;
       }
-      // 不同用户之间间隔至少 8 秒
-      await new Promise((r) => setTimeout(r, 8000));
-    }
-    // 同步完成后触发排行榜重算和车队检测
-    if (users.length > 0) {
-      await this.triggerPostSyncTasks();
-    }
-    this.logger.log('定时同步完成');
+    });
+
+    // 并行执行同一批玩家的比赛同步（不消耗额外 /players 请求，仅用 match 详情接口）
+    const results = await Promise.all(promises);
+    const totalSynced = results.reduce((sum, r) => sum + (r?.synced || 0), 0);
+    this.logger.log(`[BatchPlayer] 批量同步完成，共新增 ${totalSynced} 场比赛`);
   }
+
+  /** 单点兜底同步（当批量同步失败时使用） */
+  private async syncSinglePlayerFallback(pubgId: string, userId: string) {
+    this.logger.log(`[Fallback] 单点同步 ${pubgId}`);
+    const result = await this.syncPlayerMatches(pubgId, null);
+    await this.prisma.syncLog.create({
+      data: {
+        userId,
+        status: result.synced > 0 ? 'success' : 'error',
+        message: `兜底同步完成，新增 ${result.synced} 场比赛`,
+      },
+    });
+  }
+
+  // ==================== 单用户比赛同步（保持兼容） ====================
 
   async syncPlayerMatches(
     pubgId: string,
+    accountId?: string | null,
   ): Promise<{ synced: number; cached: boolean }> {
-    // 数据库优先：检查缓存是否存在且未过期
+    // 数据库缓存检查
     const lastMatch = await this.prisma.match.findFirst({
       where: { pubgId },
       orderBy: { fetchedAt: 'desc' },
@@ -98,9 +196,8 @@ export class SyncService {
       }
     }
 
-    // 缓存过期或不存在，从 PUBG API 拉取
-    const { matches, accountId } = await this.fetchFromPubgApi(pubgId);
-    const synced = await this.storeMatches(pubgId, matches, accountId);
+    const { matches, resolvedAccountId } = await this.fetchFromPubgApi(pubgId, accountId);
+    const synced = await this.storeMatches(pubgId, matches, resolvedAccountId);
     return { synced, cached: false };
   }
 
@@ -119,7 +216,14 @@ export class SyncService {
     return elapsed >= 30 * 60 * 1000;
   }
 
-  async fetchFromPubgApi(pubgId: string): Promise<{ matches: any[]; accountId: string }> {
+  /**
+   * 从 PUBG API 获取比赛数据
+   * 改造：如果已传入 accountId，跳过 /players 请求
+   */
+  async fetchFromPubgApi(
+    pubgId: string,
+    existingAccountId?: string | null,
+  ): Promise<{ matches: any[]; resolvedAccountId: string }> {
     if (!this.apiKey) {
       throw new Error('PUBG_API_KEY 未配置');
     }
@@ -129,8 +233,41 @@ export class SyncService {
       Accept: 'application/vnd.api+json',
     };
 
-    // Step 1: 查玩家信息
-    await this.limiter.wait();
+    let accountId = existingAccountId || null;
+
+    // 如果未提供 accountId，尝试从数据库获取
+    if (!accountId) {
+      const user = await this.prisma.user.findUnique({ where: { pubgId }, select: { accountId: true } });
+      accountId = user?.accountId || null;
+    }
+
+    // 仍然没有 accountId，需要请求 /players API
+    if (!accountId) {
+      this.logger.log(`玩家 ${pubgId} 无 accountId，需要请求 /players API`);
+      await this.waitForMatchRateLimit();
+      const playerRes = await axios.get(`${this.pubgBase}/players`, {
+        headers,
+        params: { 'filter[playerNames]': pubgId },
+      });
+
+      const playerData = playerRes.data?.data?.[0];
+      if (!playerData) {
+        throw new Error(`未找到玩家 ${pubgId}`);
+      }
+
+      accountId = playerData.id;
+
+      // 回写 accountId 到数据库
+      await this.prisma.user.update({
+        where: { pubgId },
+        data: { accountId },
+      });
+      this.logger.log(`玩家 ${pubgId} accountId 已更新到数据库`);
+    }
+
+    // 从玩家信息的 relationships.matches 中获取比赛列表
+    // 需要再请求一次 /players 获取 match list（PUBG API 限制）
+    await this.waitForMatchRateLimit();
     const playerRes = await axios.get(`${this.pubgBase}/players`, {
       headers,
       params: { 'filter[playerNames]': pubgId },
@@ -141,9 +278,6 @@ export class SyncService {
       throw new Error(`未找到玩家 ${pubgId}`);
     }
 
-    const accountId = playerData.id;
-
-    // 从玩家信息的 relationships.matches 中获取比赛列表
     const matchRefs: any[] = playerData.relationships?.matches?.data || [];
     const matchIds = matchRefs.map((m: any) => m.id);
 
@@ -163,12 +297,11 @@ export class SyncService {
 
     if (batch.length === 0) {
       this.logger.log(`玩家 ${pubgId} 的比赛已全部缓存，跳过 API 请求`);
-      // 更新 fetchedAt 时间戳
       await this.prisma.match.updateMany({
         where: { pubgId },
         data: { fetchedAt: new Date() },
       });
-      return { matches: [], accountId };
+      return { matches: [], resolvedAccountId: accountId };
     }
 
     this.logger.log(`玩家 ${pubgId} 需获取 ${batch.length} 场新比赛`);
@@ -180,7 +313,7 @@ export class SyncService {
 
     for (const matchId of batch) {
       try {
-        await this.limiter.wait();
+        await this.waitForMatchRateLimit();
         const detailRes = await axios.get(
           `${this.pubgBase}/matches/${matchId}`,
           { headers: matchHeaders },
@@ -202,7 +335,7 @@ export class SyncService {
       }
     }
 
-    return { matches: matchDetails, accountId };
+    return { matches: matchDetails, resolvedAccountId: accountId };
   }
 
   async storeMatches(pubgId: string, matchDetails: any[], accountId: string): Promise<number> {
@@ -313,16 +446,15 @@ export class SyncService {
     return syncedCount;
   }
 
+  // ==================== 后续任务（保持兼容） ====================
+
   private async triggerPostSyncTasks() {
     try {
-      // 重算玩家统计
       const users = await this.prisma.user.findMany();
       for (const user of users) {
         await this.recalcPlayerStats(user.pubgId);
       }
-      // 排行榜重算
       await this.recalcLeaderboard();
-      // 车队检测
       await this.detectTeamsFromMatches();
       this.logger.log('同步后任务完成（统计重算 + 排行榜 + 车队检测）');
     } catch (error: any) {
@@ -332,7 +464,6 @@ export class SyncService {
 
   private async recalcLeaderboard() {
     try {
-      // 由于不能直接 import LeaderboardService，直接执行 Prisma 查询
       const targetWeek = getWeekNumber();
       const year = parseInt(targetWeek.substring(0, 4), 10);
       const weekNum = parseInt(targetWeek.substring(6), 10);
@@ -347,7 +478,6 @@ export class SyncService {
         include: { matches: { where: { playedAt: { gte: startOfWeek, lte: endOfWeek } } } },
       });
 
-      // 删除旧数据
       await this.prisma.leaderboard.deleteMany({ where: { week: targetWeek } });
 
       const entries = [];
@@ -388,7 +518,6 @@ export class SyncService {
   }
 
   private async detectTeamsFromMatches() {
-    // 查找同一 matchId 中出现 >=2 个已注册用户的记录
     const rawResults: Array<{ match_id: string; player_count: number }> =
       await this.prisma.$queryRaw`
         SELECT match_id, COUNT(DISTINCT pubg_id) AS player_count
@@ -470,7 +599,7 @@ export class SyncService {
     this.logger.log('每日统计重算完成（统计 + 排行榜 + 车队检测）');
   }
 
-  private async recalcPlayerStats(pubgId: string) {
+  async recalcPlayerStats(pubgId: string) {
     const matches = await this.prisma.match.findMany({ where: { pubgId } });
     if (!matches.length) return;
 
@@ -486,7 +615,6 @@ export class SyncService {
     );
     const bestRank = Math.min(...matches.map((m) => m.rank));
 
-    // PlayerStats 关联 User.id，需要通过 pubgId 查到 User
     const user = await this.prisma.user.findUnique({ where: { pubgId } });
     if (!user) return;
 

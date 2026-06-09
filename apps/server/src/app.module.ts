@@ -14,6 +14,7 @@ import { SocialModule } from './modules/social/social.module';
 import { GraphModule } from './modules/graph/graph.module';
 import { PlayersModule } from './modules/players/players.module';
 import { AdminModule } from './modules/admin/admin.module';
+import { PubgModule } from './modules/pubg/pubg.module';
 import { HealthController } from './modules/health/health.controller';
 
 @Module({
@@ -34,6 +35,7 @@ import { HealthController } from './modules/health/health.controller';
     GraphModule,
      PlayersModule,
      AdminModule,
+     PubgModule,
   ],
   controllers: [HealthController],
   providers: [PrismaService],

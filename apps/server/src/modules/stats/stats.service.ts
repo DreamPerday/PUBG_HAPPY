@@ -1,5 +1,7 @@
 import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { PrismaService } from '../../prisma.service';
+import { PubgBatchService } from '../pubg/services/pubg-batch.service';
+import { PubgCacheService, CacheNamespace } from '../pubg/services/pubg-cache.service';
 import axios from 'axios';
 
 @Injectable()
@@ -8,77 +10,91 @@ export class StatsService {
   private readonly pubgBase = process.env.PUBG_API_BASE || 'https://api.pubg.com/shards/steam';
   private readonly apiKey = process.env.PUBG_API_KEY;
 
-  constructor(private readonly prisma: PrismaService) {}
+  /** 限流器 */
+  private timestamps: number[] = [];
+  private readonly maxPerMinute = 8;
+  private readonly windowMs = 60_000;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly pubgBatchService: PubgBatchService,
+    private readonly cacheService: PubgCacheService,
+  ) {}
+
+  private async waitForRateLimit(): Promise<void> {
+    const now = Date.now();
+    this.timestamps = this.timestamps.filter((t) => now - t < this.windowMs);
+    if (this.timestamps.length >= this.maxPerMinute) {
+      const oldest = this.timestamps[0];
+      const waitMs = this.windowMs - (now - oldest) + 1000;
+      await new Promise((r) => setTimeout(r, waitMs));
+    }
+    this.timestamps.push(Date.now());
+  }
 
   async getSeasonStats(pubgId: string) {
     if (!this.apiKey) throw new Error('PUBG_API_KEY 未配置');
 
-    const headers = {
-      Authorization: `Bearer ${this.apiKey}`,
-      Accept: 'application/vnd.api+json',
+    // 1. 获取 accountId（优先使用缓存或数据库）
+    const accountIdMap = await this.pubgBatchService.batchGetAccountIds([pubgId]);
+    const accountId = accountIdMap.get(pubgId);
+    if (!accountId) throw new NotFoundException('未找到玩家');
+
+    // 2. 获取赛季列表（缓存 24 小时）
+    const cachedSeasons = await this.cacheService.get<{ id: string; isCurrent: boolean }[]>(
+      CacheNamespace.SEASON_LIST,
+    );
+    let seasons: { id: string; isCurrent: boolean }[];
+    if (cachedSeasons) {
+      seasons = cachedSeasons;
+    } else {
+      await this.waitForRateLimit();
+      const seasonsRes = await axios.get(`${this.pubgBase}/seasons`, {
+        headers: { Authorization: `Bearer ${this.apiKey}`, Accept: 'application/vnd.api+json' },
+      });
+      seasons = (seasonsRes.data?.data || []).map((s: any) => ({
+        id: s.id,
+        isCurrent: s.attributes?.isCurrentSeason === true,
+      }));
+      await this.cacheService.set(CacheNamespace.SEASON_LIST, seasons, 86400);
+    }
+
+    const currentSeason = seasons.find((s) => s.isCurrent === true);
+    const seasonId = currentSeason?.id || 'lifetime';
+
+    // 3. 使用批量接口获取赛季统计（或从缓存读取）
+    const batchResults = await this.pubgBatchService.batchFetchSeasonStats([accountId], seasonId, 'squad');
+    const squadResult = batchResults.find((r) => r.accountId === accountId);
+    const squadStats = squadResult?.stats || {
+      roundsPlayed: 0, kills: 0, damageDealt: 0, wins: 0, headshotKills: 0,
+      assists: 0, revives: 0, longestKill: 0, bestRank: 99, avgRank: 0, winPoints: 0,
     };
 
-    try {
-      const playerRes = await axios.get(`${this.pubgBase}/players`, {
-        headers,
-        params: { 'filter[playerNames]': pubgId },
-      });
-      const playerData = playerRes.data?.data?.[0];
-      if (!playerData) throw new NotFoundException('未找到玩家');
-      const accountId = playerData.id;
+    // 4. 获取 squad-fpp 数据
+    const fppResults = await this.pubgBatchService.batchFetchSeasonStats([accountId], seasonId, 'squad-fpp');
+    const fppResult = fppResults.find((r) => r.accountId === accountId);
+    const fppStats = fppResult?.stats || {
+      roundsPlayed: 0, kills: 0, damageDealt: 0, wins: 0, headshotKills: 0,
+      assists: 0, revives: 0, longestKill: 0, bestRank: 99, avgRank: 0, winPoints: 0,
+    };
 
-      const seasonsRes = await axios.get(`${this.pubgBase}/seasons`, { headers });
-      const seasons = seasonsRes.data?.data || [];
-      const currentSeason = seasons.find((s: any) => s.attributes?.isCurrentSeason === true);
-      const seasonId = currentSeason?.id || 'lifetime';
+    const totalRounds = squadStats.roundsPlayed + fppStats.roundsPlayed;
 
-      const statsRes = await axios.get(
-        `${this.pubgBase}/players/${accountId}/seasons/${seasonId}`,
-        { headers },
-      );
-      const statsData = statsRes.data?.data?.attributes;
-      const gameModes = statsData?.gameModeStats || {};
-
-      const extract = (mode: any) => ({
-      roundsPlayed: mode?.roundsPlayed || 0,
-      kills: mode?.kills || 0,
-      damageDealt: mode?.damageDealt || 0,
-      wins: mode?.wins || 0,
-      headshotKills: mode?.headshotKills || 0,
-      assists: mode?.assists || 0,
-      revives: mode?.revives || 0,
-      longestKill: mode?.longestKill || 0,
-      bestRank: mode?.bestRank || 99,
-      avgRank: mode?.avgRank || 0,
-      winPoints: mode?.winPoints || 0,
-    });
-
-    const squad = extract(gameModes.squad);
-    const squadFpp = extract(gameModes['squad-fpp']);
-    const totalRounds = squad.roundsPlayed + squadFpp.roundsPlayed;
-
-      return {
-        roundsPlayed: totalRounds,
-        kills: squad.kills + squadFpp.kills,
-        damageDealt: Math.round((squad.damageDealt + squadFpp.damageDealt) * 100) / 100,
-        wins: squad.wins + squadFpp.wins,
-        headshotKills: squad.headshotKills + squadFpp.headshotKills,
-        assists: squad.assists + squadFpp.assists,
-        revives: squad.revives + squadFpp.revives,
-        longestKill: Math.max(squad.longestKill, squadFpp.longestKill),
-        bestRank: Math.min(squad.bestRank, squadFpp.bestRank),
-        avgKills: totalRounds > 0 ? Math.round(((squad.kills + squadFpp.kills) / totalRounds) * 100) / 100 : 0,
-        avgDamage: totalRounds > 0 ? Math.round(((squad.damageDealt + squadFpp.damageDealt) / totalRounds) * 100) / 100 : 0,
-        winRate: totalRounds > 0 ? Math.round(((squad.wins + squadFpp.wins) / totalRounds) * 10000) / 10000 : 0,
-        seasonId,
-      };
-    } catch (err: any) {
-      if (err.response?.status === 429) {
-        this.logger.warn(`PUBG API 限流，赛季统计暂时不可用`);
-        return null;
-      }
-      throw err;
-    }
+    return {
+      roundsPlayed: totalRounds,
+      kills: squadStats.kills + fppStats.kills,
+      damageDealt: Math.round((squadStats.damageDealt + fppStats.damageDealt) * 100) / 100,
+      wins: squadStats.wins + fppStats.wins,
+      headshotKills: squadStats.headshotKills + fppStats.headshotKills,
+      assists: squadStats.assists + fppStats.assists,
+      revives: squadStats.revives + fppStats.revives,
+      longestKill: Math.max(squadStats.longestKill, fppStats.longestKill),
+      bestRank: Math.min(squadStats.bestRank, fppStats.bestRank),
+      avgKills: totalRounds > 0 ? Math.round(((squadStats.kills + fppStats.kills) / totalRounds) * 100) / 100 : 0,
+      avgDamage: totalRounds > 0 ? Math.round(((squadStats.damageDealt + fppStats.damageDealt) / totalRounds) * 100) / 100 : 0,
+      winRate: totalRounds > 0 ? Math.round(((squadStats.wins + fppStats.wins) / totalRounds) * 10000) / 10000 : 0,
+      seasonId,
+    };
   }
 
   async getOverview() {
@@ -110,12 +126,9 @@ export class StatsService {
   }
 
   async getPlayerStats(userId: string, pubgId?: string) {
-    // Resolve pubgId if only userId is provided
     if (!pubgId) {
       const user = await this.prisma.user.findFirst({
-        where: {
-          OR: [{ id: userId }, { pubgId: userId }],
-        },
+        where: { OR: [{ id: userId }, { pubgId: userId }] },
         select: { id: true, pubgId: true },
       });
       if (!user) throw new NotFoundException('用户不存在');
@@ -161,7 +174,6 @@ export class StatsService {
   }
 
   async recalculateStats(userId: string, pubgId?: string) {
-    // Resolve pubgId if only userId is provided
     if (!pubgId) {
       const user = await this.prisma.user.findUnique({ where: { id: userId }, select: { pubgId: true } });
       if (!user) return;

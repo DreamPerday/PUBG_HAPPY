@@ -11,6 +11,7 @@ model User {
   id        String   @id @default(cuid())
   nickname  String   @unique
   pubgId    String   @unique @map("pubg_id")
+  accountId String?  @map("account_id")
   avatar    String?
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
