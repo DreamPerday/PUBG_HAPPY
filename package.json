@@ -1,0 +1,17 @@
+{
+  "name": "pubg-squad-stats",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm -r --parallel dev",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "db:migrate": "pnpm --filter server db:migrate",
+    "db:generate": "pnpm --filter server db:generate",
+    "db:studio": "pnpm --filter server db:studio"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "packageManager": "pnpm@8.15.0"
+}

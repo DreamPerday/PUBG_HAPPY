@@ -1,0 +1,212 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  nickname  String   @unique
+  pubgId    String   @unique @map("pubg_id")
+  avatar    String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  matches        Match[]
+  leaderboard    Leaderboard[]
+  teamMembers    TeamMember[]
+  comments       Comment[]
+  danmaku        Danmaku[]
+  playerStats    PlayerStats?
+
+  @@map("users")
+}
+
+model PlayerStats {
+  id              String   @id @default(cuid())
+  playerId        String   @unique @map("player_id")
+  player          User     @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  totalMatches    Int      @default(0) @map("total_matches")
+  totalWins       Int      @default(0) @map("total_wins")
+  totalKills      Int      @default(0) @map("total_kills")
+  totalDamage     Float    @default(0) @map("total_damage")
+  totalHeadshots  Int      @default(0) @map("total_headshots")
+  avgKills        Float    @default(0) @map("avg_kills")
+  avgDamage       Float    @default(0) @map("avg_damage")
+  avgSurvivalTime Int      @default(0) @map("avg_survival_time")
+  bestRank        Int      @default(99) @map("best_rank")
+  kda             Float    @default(0)
+  winRate         Float    @default(0) @map("win_rate")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("player_stats")
+}
+
+model Match {
+  id           String   @id @default(cuid())
+  matchId      String   @map("match_id")
+  pubgId       String   @map("pubg_id")
+  user         User     @relation(fields: [pubgId], references: [pubgId], onDelete: Cascade)
+  mode         String
+  mapName      String   @map("map_name")
+  kills        Int      @default(0)
+  damage       Float    @default(0)
+  rank         Int
+  survivalTime Int      @map("survival_time")
+  headshots    Int      @default(0)
+  assists      Int      @default(0)
+  revives      Int      @default(0)
+  teamKills    Int      @default(0) @map("team_kills")
+  won          Boolean  @default(false)
+  playedAt     DateTime @map("played_at")
+  fetchedAt    DateTime @default(now()) @map("fetched_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  participants String?  @map("participants")
+
+  @@unique([matchId, pubgId])
+  @@index([pubgId, playedAt])
+  @@index([matchId])
+  @@map("matches")
+}
+
+model MatchTelemetry {
+  id        String   @id @default(cuid())
+  matchId   String   @unique @map("match_id")
+  rawJson   String   @map("raw_json")
+  fetchedAt DateTime @default(now()) @map("fetched_at")
+
+  @@map("match_telemetry")
+}
+
+model Team {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  members TeamMember[]
+  leaderboard Leaderboard[]
+  weeklyReport WeeklyReport[]
+
+  @@map("teams")
+}
+
+model TeamMember {
+  id         String @id @default(cuid())
+  teamId     String @map("team_id")
+  team       Team   @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  userId     String @map("user_id")
+  user       User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  matchCount Int    @default(0) @map("match_count")
+
+  @@unique([teamId, userId])
+  @@map("team_members")
+}
+
+model Leaderboard {
+  id       String   @id @default(cuid())
+  type     String
+  category String
+  userId   String   @map("user_id")
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  teamId   String?  @map("team_id")
+  team     Team?    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  score    Float
+  week     String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([type, category, userId, week])
+  @@index([type, week])
+  @@map("leaderboard")
+}
+
+model WeeklyReport {
+  id            String   @id @default(cuid())
+  week          String
+  teamId        String?  @map("team_id")
+  team          Team?    @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  title         String
+  content       String   @map("content_json")
+  topPlayers    String   @map("top_players")
+  funnyRankings String   @map("funny_rankings")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@unique([week, teamId])
+  @@map("weekly_report")
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content   String
+  pageId    String   @map("page_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([pageId, createdAt])
+  @@map("comments")
+}
+
+model Danmaku {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content   String
+  pageId    String   @map("page_id")
+  color     String   @default("#ff9500")
+  position  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([pageId, createdAt])
+  @@map("danmaku")
+}
+
+model SyncLog {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  status    String
+  message   String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId, createdAt])
+  @@map("sync_log")
+}
+
+model PlayerRelation {
+  id                  String   @id @default(cuid())
+  playerA             String   @map("player_a")
+  playerB             String   @map("player_b")
+  togetherMatches     Int      @default(0) @map("together_matches")
+  totalMatchesA       Int      @default(0) @map("total_matches_a")
+  totalMatchesB       Int      @default(0) @map("total_matches_b")
+  relationStrength    Float    @default(0) @map("relation_strength")
+  lastPlayedAt        DateTime @map("last_played_at")
+
+  @@unique([playerA, playerB])
+  @@index([playerA])
+  @@index([playerB])
+  @@map("player_relations")
+}
+
+model TeamGraphCluster {
+  id             String   @id @default(cuid())
+  clusterName    String   @map("cluster_name")
+  memberPubgIds  String   @map("member_pubg_ids")
+  avgStrength    Float    @default(0) @map("avg_strength")
+  stabilityScore Float    @default(0) @map("stability_score")
+  matchCount     Int      @default(0) @map("match_count")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@map("team_graph_clusters")
+}
+
+model SystemConfig {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("system_configs")
+}

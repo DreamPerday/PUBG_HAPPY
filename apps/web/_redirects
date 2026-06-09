@@ -1,0 +1,4 @@
+# Cloudflare Pages redirects
+# 将 /api/* 的请求代理到后端 Railway 地址
+# 部署后请将下面的 URL 替换为实际的 Railway 后端地址
+/api/*  https://pubg-server.up.railway.app/api/:splat  200
