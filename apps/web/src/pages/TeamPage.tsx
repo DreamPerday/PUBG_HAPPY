@@ -14,7 +14,7 @@ import {
   Medal,
   ChevronRight,
 } from 'lucide-react'
-import { getTeam, getTeams, getTeamStats, getAllTeamStats, type TeamDetail, type TeamStats, type Team, type TeamComparison } from '@/api/teamApi'
+import { getTeam, getTeams, getTeamStats, getTeamMatchups, getAllTeamStats, type TeamDetail, type TeamStats, type Team, type TeamComparison, type TeamMatchupItem } from '@/api/teamApi'
 import Chart from '@/components/Chart'
 import StatCard from '@/components/StatCard'
 import { useStore } from '@/store/useStore'
@@ -170,16 +170,19 @@ function TeamDetailView({ teamId }: { teamId: string }) {
   const [loading, setLoading] = useState(true)
   const [team, setTeam] = useState<TeamDetail | null>(null)
   const [teamStats, setTeamStats] = useState<TeamStats | null>(null)
+  const [matchups, setMatchups] = useState<TeamMatchupItem[]>([])
 
   useEffect(() => {
     setLoading(true)
     Promise.all([
       getTeam(teamId),
       getTeamStats(teamId),
+      getTeamMatchups(teamId),
     ])
-      .then(([teamData, statsData]) => {
+      .then(([teamData, statsData, matchupData]) => {
         setTeam(teamData)
         setTeamStats(statsData)
+        setMatchups(matchupData || [])
       })
       .finally(() => setLoading(false))
   }, [teamId])
@@ -421,6 +424,43 @@ function TeamDetailView({ teamId }: { teamId: string }) {
           })}
         </div>
       </div>
+
+      {/* 撞车记录 */}
+      {matchups.length > 0 && (
+        <div>
+          <div className="flex items-center gap-2 mb-4">
+            <Swords className="w-5 h-5 text-pubg-orange" />
+            <h2 className="text-lg font-bold text-white">撞车记录</h2>
+            <span className="text-pubg-muted text-sm">({matchups.length}次)</span>
+          </div>
+          <div className="space-y-3">
+            {matchups.map((m) => {
+              const d = new Date(m.playedAt)
+              const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+              return (
+                <div key={m.matchId + '-' + m.opponentTeam.id} className="pubg-card py-3 px-5 flex items-center gap-4">
+                  <div className="flex items-center gap-2 min-w-[100px] text-sm text-pubg-muted">
+                    <Crosshair className="w-3.5 h-3.5" />
+                    <span>{dateStr}</span>
+                  </div>
+                  <div className="flex-1 flex items-center gap-3">
+                    <span className="text-sm font-bold text-white">{team?.name}</span>
+                    <span className="text-xs text-pubg-muted px-2 py-0.5 rounded border border-pubg-border">vs</span>
+                    <span className="text-sm font-bold text-pubg-orange">{m.opponentTeam.name}</span>
+                  </div>
+                  <div className="hidden sm:flex items-center gap-1.5 text-xs text-pubg-muted">
+                    {m.opponentTeam.members?.slice(0, 4).map((mm: any) => (
+                      <span key={mm.user.pubgId} className="px-2 py-0.5 rounded-full bg-pubg-dark border border-pubg-border">
+                        {mm.user.nickname}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

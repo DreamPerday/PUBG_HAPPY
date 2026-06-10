@@ -6,129 +6,157 @@ export class TeamsService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
-   * 自动检测车队：查找同一 match 中同一队伍（roster）的已注册用户，
-   * 自动创建或更新车队以及队员关系。每支车队最多4人。
+   * 自动检测车队：使用图论最大团算法
+   *
+   * 规则：
+   * 1. 车队所有成员必须是全连通的（每对玩家至少一起打过一局比赛）
+   * 2. 允许一个车队是另一个车队的子集
+   *
+   * 算法：Bron-Kerbosch 查找所有最大团
    */
   async detectTeams() {
-    // 1. 按 matchId 分组，找出包含 >=2 个不同 pubgId 的比赛
-    const rawResults: Array<{ match_id: string; player_count: number }> =
-      await this.prisma.$queryRaw`
-        SELECT match_id, COUNT(DISTINCT pubg_id) AS player_count
-        FROM matches
-        GROUP BY match_id
-        HAVING COUNT(DISTINCT pubg_id) >= 2
-      `;
+    // 1. 找出有 2+ 已注册用户共同参与的比赛
+    const matchGroups: Array<{ match_id: string }> = await this.prisma.$queryRaw`
+      SELECT match_id
+      FROM matches
+      GROUP BY match_id
+      HAVING COUNT(DISTINCT pubg_id) >= 2
+    `;
 
-    const results: Array<{ team: any; members: any[]; matchId: string }> = [];
-    const matchIds = rawResults.map((r) => r.match_id);
-
-    // 批量加载 participants
-    const participantRecords = await this.prisma.match.findMany({
-      where: { matchId: { in: matchIds }, participants: { not: null } },
-      select: { matchId: true, participants: true },
-    });
-    const participantsByMatch = new Map<string, any[]>();
-    for (const r of participantRecords) {
-      if (r.participants) {
-        try {
-          participantsByMatch.set(r.matchId, typeof r.participants === 'string' ? JSON.parse(r.participants) : r.participants);
-        } catch { /* ignore */ }
-      }
+    if (matchGroups.length === 0) {
+      return { message: '没有含多名玩家的比赛' };
     }
 
-    for (const row of rawResults) {
-      const matchId = row.match_id;
+    // 2. 获取所有已注册用户
+    const allUsers = await this.prisma.user.findMany({
+      select: { id: true, pubgId: true, nickname: true },
+    });
+    if (allUsers.length < 2) {
+      return { message: '注册用户不足 2 人' };
+    }
 
-      // 2. 获取该 match 中的所有 pubgId
-      const matchRecords = await this.prisma.match.findMany({
-        where: { matchId },
+    const userIdByPubgId = new Map(allUsers.map((u) => [u.pubgId, u.id]));
+    const userNicknameById = new Map(allUsers.map((u) => [u.id, u.nickname]));
+
+    // 3. 构建邻接图
+    const adjacency = new Map<string, Set<string>>();
+    for (const u of allUsers) adjacency.set(u.id, new Set());
+
+    for (const row of matchGroups) {
+      const records = await this.prisma.match.findMany({
+        where: { matchId: row.match_id },
         select: { pubgId: true },
       });
-      const pubgIds = [...new Set(matchRecords.map((r) => r.pubgId))];
-
-      // 3. 找已注册的用户
-      const users = await this.prisma.user.findMany({
-        where: { pubgId: { in: pubgIds } },
-      });
-      if (users.length < 2) continue;
-
-      const userMap = new Map(users.map((u) => [u.pubgId, u]));
-
-      // 4. 按 rosterId 分组
-      const participants = participantsByMatch.get(matchId);
-      const rosterTeams: string[][] = [];
-      if (participants) {
-        const rosterMap = new Map<string, string[]>();
-        for (const p of participants) {
-          const name: string = p.name || '';
-          const rosterId: string = p.rosterId || '';
-          if (!name || !rosterId) continue;
-          if (!userMap.has(name)) continue;
-          if (!rosterMap.has(rosterId)) rosterMap.set(rosterId, []);
-          rosterMap.get(rosterId)!.push(name);
+      const matchedIds = [
+        ...new Set(
+          records
+            .map((r) => userIdByPubgId.get(r.pubgId))
+            .filter(Boolean) as string[],
+        ),
+      ];
+      if (matchedIds.length < 2) continue;
+      for (const u of matchedIds) {
+        for (const v of matchedIds) {
+          if (u !== v) adjacency.get(u)!.add(v);
         }
-        for (const [, names] of rosterMap) {
-          if (names.length >= 2) rosterTeams.push(names);
-        }
-      }
-
-      // 若没有 participants 数据则回退到整场比赛
-      const teams = rosterTeams.length > 0 ? rosterTeams : [pubgIds.filter((id) => userMap.has(id))];
-
-      for (const teamPubgIds of teams) {
-        if (teamPubgIds.length < 2) continue;
-        const teamUsers = teamPubgIds.map((pubgId) => userMap.get(pubgId)!).filter(Boolean);
-        const userIds = teamUsers.map((u) => u.id);
-
-        // 5. 找已存在的车队成员关系
-        const existingMembers = await this.prisma.teamMember.findMany({
-          where: { userId: { in: userIds } },
-          include: { team: true },
-        });
-
-        // 统计每个车队的重叠成员数
-        const overlapMap = new Map<string, number>();
-        for (const member of existingMembers) {
-          overlapMap.set(member.teamId, (overlapMap.get(member.teamId) || 0) + 1);
-        }
-
-        // 选重叠最多的车队
-        let bestTeamId: string | null = null;
-        let bestOverlap = 0;
-        for (const [teamId, overlap] of overlapMap) {
-          if (overlap > bestOverlap) {
-            bestOverlap = overlap;
-            bestTeamId = teamId;
-          }
-        }
-
-        let team;
-        if (bestTeamId) {
-          team = await this.prisma.team.findUnique({ where: { id: bestTeamId } });
-        }
-
-        // 6. 没有合适的车队则新建
-        if (!team) {
-          const teamName = teamUsers.map((u) => u.nickname).join('、') + '的车队';
-          team = await this.prisma.team.create({
-            data: { name: teamName },
-          });
-        }
-
-        // 7. 更新/创建队员关系
-        for (const userId of userIds) {
-          await this.prisma.teamMember.upsert({
-            where: { teamId_userId: { teamId: team.id, userId } },
-            update: { matchCount: { increment: 1 } },
-            create: { teamId: team.id, userId, matchCount: 1 },
-          });
-        }
-
-        results.push({ team, members: teamUsers, matchId });
       }
     }
 
-    return results;
+    // 4. Bron-Kerbosch 查找所有最大团
+    const allNodes = [...adjacency.entries()]
+      .filter(([, neighbors]) => neighbors.size > 0)
+      .map(([id]) => id);
+
+    if (allNodes.length < 2) {
+      return { message: '没有连通的玩家关系' };
+    }
+
+    const cliques: string[][] = [];
+
+    const bronKerbosch = (R: Set<string>, P: Set<string>, X: Set<string>) => {
+      if (P.size === 0 && X.size === 0) {
+        if (R.size >= 2) cliques.push([...R].sort());
+        return;
+      }
+      const pArr = [...P];
+      for (const v of pArr) {
+        const neighbors = adjacency.get(v) || new Set();
+        bronKerbosch(
+          new Set([...R, v]),
+          new Set(pArr.filter((x) => x !== v && neighbors.has(x))),
+          new Set([...X].filter((x) => neighbors.has(x))),
+        );
+        P.delete(v);
+        X.add(v);
+      }
+    };
+
+    bronKerbosch(new Set(), new Set(allNodes), new Set());
+
+    if (cliques.length === 0) {
+      return { message: '没有形成任何有效车队', cliques: 0 };
+    }
+
+    // 5. 收集已有车队信息
+    const existingTeams = await this.prisma.team.findMany({
+      include: { members: { select: { userId: true } } },
+    });
+
+    const teamByMemberKey = new Map<string, any>();
+    for (const team of existingTeams) {
+      const key = team.members.map((m: any) => m.userId).sort().join(',');
+      teamByMemberKey.set(key, team);
+    }
+
+    // 6. 清空旧成员关系
+    await this.prisma.teamMember.deleteMany();
+
+    // 7. 创建/更新车队
+    const activeTeamIds = new Set<string>();
+
+    for (const memberIds of cliques) {
+      const memberKey = [...memberIds].sort().join(',');
+      const existing = teamByMemberKey.get(memberKey);
+
+      let teamId: string;
+      if (existing) {
+        teamId = existing.id;
+        activeTeamIds.add(teamId);
+      } else {
+        const nicknames = memberIds
+          .map((id) => userNicknameById.get(id) || '未知')
+          .join('、');
+        const team = await this.prisma.team.create({
+          data: { name: `${nicknames}的车队` },
+        });
+        teamId = team.id;
+        activeTeamIds.add(teamId);
+      }
+
+      for (const userId of memberIds) {
+        const pubgId = allUsers.find((u) => u.id === userId)?.pubgId;
+        const matchCount = pubgId
+          ? await this.prisma.match.count({ where: { pubgId } })
+          : 0;
+
+        await this.prisma.teamMember.create({
+          data: { teamId, userId, matchCount },
+        });
+      }
+    }
+
+    // 8. 清理过期车队
+    for (const team of existingTeams) {
+      if (!activeTeamIds.has(team.id)) {
+        await this.prisma.team.delete({ where: { id: team.id } }).catch(() => {});
+      }
+    }
+
+    return {
+      message: `车队检测完成，共 ${cliques.length} 个全连通车队`,
+      cliques: cliques.length,
+      members: cliques.reduce((s, c) => s + c.length, 0),
+    };
   }
 
   /** 获取用户所属的所有车队 */
@@ -343,10 +371,68 @@ export class TeamsService {
       worstTeam: worst[0] || null,
     };
   }
-}
 
-/**
- * 解析周标识 "2026-W24" => { start: Date, end: Date }
+  // ==================== 撞车记录 ====================
+
+  /** 获取某个车队的撞车记录（含对手车队信息） */
+  async getTeamMatchups(teamId: string) {
+    const matchups = await this.prisma.teamMatchup.findMany({
+      where: {
+        OR: [{ teamAId: teamId }, { teamBId: teamId }],
+      },
+      include: {
+        teamA: {
+          include: {
+            members: { include: { user: { select: { nickname: true, pubgId: true } } } },
+          },
+        },
+        teamB: {
+          include: {
+            members: { include: { user: { select: { nickname: true, pubgId: true } } } },
+          },
+        },
+      },
+      orderBy: { playedAt: 'desc' },
+    });
+
+    return matchups.map((m) => ({
+      matchId: m.matchId,
+      playedAt: m.playedAt,
+      opponentTeam:
+        m.teamAId === teamId
+          ? { id: m.teamBId, name: m.teamB.name, members: m.teamB.members }
+          : { id: m.teamAId, name: m.teamA.name, members: m.teamA.members },
+    }));
+  }
+
+  /** 获取所有撞车记录 */
+  async getAllMatchups() {
+    const matchups = await this.prisma.teamMatchup.findMany({
+      include: {
+        teamA: {
+          include: {
+            members: { include: { user: { select: { nickname: true, pubgId: true } } } },
+          },
+        },
+        teamB: {
+          include: {
+            members: { include: { user: { select: { nickname: true, pubgId: true } } } },
+          },
+        },
+      },
+      orderBy: { playedAt: 'desc' },
+      take: 100,
+    });
+
+    return matchups.map((m) => ({
+      matchId: m.matchId,
+      playedAt: m.playedAt,
+      teamA: { id: m.teamAId, name: m.teamA.name, members: m.teamA.members },
+      teamB: { id: m.teamBId, name: m.teamB.name, members: m.teamB.members },
+    }));
+  }
+}
+/** 解析周标识 "2026-W24" => { start: Date, end: Date }
  */
 function parseWeek(week: string): { start: Date; end: Date } | null {
   const match = week.match(/^(\d{4})-W(\d{1,2})$/);

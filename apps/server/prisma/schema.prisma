@@ -87,9 +87,11 @@ model Team {
   name      String
   createdAt DateTime @default(now()) @map("created_at")
 
-  members TeamMember[]
-  leaderboard Leaderboard[]
-  weeklyReport WeeklyReport[]
+  members        TeamMember[]
+  leaderboard    Leaderboard[]
+  weeklyReport   WeeklyReport[]
+  matchupsAsA    TeamMatchup[] @relation("TeamMatchupA")
+  matchupsAsB    TeamMatchup[] @relation("TeamMatchupB")
 
   @@map("teams")
 }
@@ -104,6 +106,22 @@ model TeamMember {
 
   @@unique([teamId, userId])
   @@map("team_members")
+}
+
+model TeamMatchup {
+  id        String   @id @default(cuid())
+  matchId   String   @map("match_id")
+  teamAId   String   @map("team_a_id")
+  teamA     Team     @relation("TeamMatchupA", fields: [teamAId], references: [id], onDelete: Cascade)
+  teamBId   String   @map("team_b_id")
+  teamB     Team     @relation("TeamMatchupB", fields: [teamBId], references: [id], onDelete: Cascade)
+  playedAt  DateTime @map("played_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([matchId, teamAId, teamBId])
+  @@index([teamAId])
+  @@index([teamBId])
+  @@map("team_matchups")
 }
 
 model Leaderboard {

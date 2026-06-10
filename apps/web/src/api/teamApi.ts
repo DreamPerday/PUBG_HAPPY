@@ -109,3 +109,39 @@ export async function getAllTeamStats(): Promise<TeamComparison> {
   const res = await api.get<ApiResponse<TeamComparison>>('/teams/all-stats')
   return res.data.data
 }
+
+// ==================== 撞车记录 ====================
+
+export interface TeamMatchupMember {
+  nickname: string
+  pubgId: string
+}
+
+export interface TeamMatchupOpponent {
+  id: string
+  name: string
+  members: Array<{ user: TeamMatchupMember }>
+}
+
+export interface TeamMatchupItem {
+  matchId: string
+  playedAt: string
+  opponentTeam: TeamMatchupOpponent
+}
+
+export interface TeamMatchupAllItem {
+  matchId: string
+  playedAt: string
+  teamA: { id: string; name: string; members: Array<{ user: TeamMatchupMember }> }
+  teamB: { id: string; name: string; members: Array<{ user: TeamMatchupMember }> }
+}
+
+export async function getTeamMatchups(teamId: string): Promise<TeamMatchupItem[]> {
+  const res = await api.get<ApiResponse<TeamMatchupItem[]>>(`/teams/${teamId}/matchups`)
+  return res.data.data
+}
+
+export async function getAllMatchups(): Promise<TeamMatchupAllItem[]> {
+  const res = await api.get<ApiResponse<TeamMatchupAllItem[]>>('/teams/matchups/all')
+  return res.data.data
+}

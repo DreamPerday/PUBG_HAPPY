@@ -45,4 +45,16 @@ export class TeamsController {
   detectTeams() {
     return this.teamsService.detectTeams();
   }
+
+  @Get(':id/matchups')
+  @ApiOperation({ summary: '获取指定车队的撞车记录' })
+  getTeamMatchups(@Param('id') id: string) {
+    return this.teamsService.getTeamMatchups(id);
+  }
+
+  @Get('matchups/all')
+  @ApiOperation({ summary: '获取所有撞车记录' })
+  getAllMatchups() {
+    return this.teamsService.getAllMatchups();
+  }
 }
